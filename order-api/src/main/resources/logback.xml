@@ -1,0 +1,15 @@
+<configuration>
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <customFields>{"service":"order-api"}</customFields>
+            <includeMdcKeyName>orderId</includeMdcKeyName>
+        </encoder>
+    </appender>
+
+    <logger name="org.apache.kafka" level="WARN"/>
+    <logger name="io.javalin" level="INFO"/>
+
+    <root level="INFO">
+        <appender-ref ref="STDOUT"/>
+    </root>
+</configuration>

@@ -1,0 +1,33 @@
+# Maven build output
+target/
+
+# Java
+*.class
+hs_err_pid*
+replay_pid*
+
+# IDE — IntelliJ
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# IDE — Eclipse
+.project
+.classpath
+.settings/
+.factorypath
+
+# IDE — VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local env / secrets
+.env
+.env.local
