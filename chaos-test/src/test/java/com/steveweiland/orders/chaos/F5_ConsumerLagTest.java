@@ -3,9 +3,6 @@ package com.steveweiland.orders.chaos;
 import com.steveweiland.orders.api.OrderProducer;
 import com.steveweiland.orders.common.Order;
 import com.steveweiland.orders.common.OrderItem;
-import com.steveweiland.orders.fulfillment.EventProducer;
-import com.steveweiland.orders.fulfillment.FulfillmentConsumer;
-import com.steveweiland.orders.fulfillment.FulfillmentStore;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.ListOffsetsResult.ListOffsetsResultInfo;
 import org.apache.kafka.clients.admin.OffsetSpec;
@@ -29,17 +26,12 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * F5 — Consumer lag under burst load (spec.md §6 F5)
+ * F5 — Consumer lag under burst load. (spec.md §6 F5)
  *
- * V1 baseline: PASSES by asserting the bug.
- * A single consumer with 50 ms work simulation cannot keep up with a burst of
- * 500 records. After 2 s of processing, lag should be hundreds of records.
- *
- * V2 expectation: with parallel-consumer or tuned max.poll.records + threading,
- * the same 500 records drain to ~0 lag within the same window.
- *
- * This test also writes target/lag-v1.txt as a portfolio artifact (the actual
- * lag number, not just pass/fail). V2 sets a tighter bound based on this baseline.
+ * V2 does NOT address F5. The same V1-baseline assertion (lag &gt; 200) is
+ * expected to hold in V2 — the consumer still does 50 ms of work per record
+ * and runs single-threaded per partition. V3 will introduce parallel consumers
+ * or {@code max.poll.records} tuning to make this lag go away.
  */
 @Tag("chaos")
 class F5_ConsumerLagTest extends KafkaTestFixture {
@@ -61,43 +53,32 @@ class F5_ConsumerLagTest extends KafkaTestFixture {
         }
         producer.close();
 
-        FulfillmentStore store = new FulfillmentStore();
-        EventProducer eventProducer = new EventProducer(bootstrap(), eventTopic);
-        FulfillmentConsumer consumer = new FulfillmentConsumer(
-                bootstrap(), orderTopic, groupId, Map.of(), eventProducer, store);
-
-        Thread worker = new Thread(consumer, "fulfillment-f5");
-        worker.start();
-        try {
+        try (V2Stack stack = new V2Stack(bootstrap(), orderTopic, eventTopic, dlqTopic,
+                groupId, Map.of(), dataSource())) {
+            stack.start();
             Thread.sleep(2000);
             long lag = measureLag();
 
-            Path artifact = Path.of("target/lag-v1.txt");
+            Path artifact = Path.of("target/lag-v2.txt");
             try {
                 Files.createDirectories(artifact.getParent());
                 Files.writeString(artifact,
-                        "burst=" + BURST + " window=2s lag=" + lag + " store=" + store.size() + "\n");
+                        "burst=" + BURST + " window=2s lag=" + lag + "\n");
             } catch (IOException ignored) {}
 
             assertTrue(lag > LAG_THRESHOLD,
-                    "V1 baseline: expected lag > " + LAG_THRESHOLD + ", got " + lag
-                            + " (store=" + store.size() + ")");
-        } finally {
-            consumer.stop();
-            worker.join(15_000);
-            eventProducer.close();
+                    "V2 keeps the V1 baseline assertion: expected lag > " + LAG_THRESHOLD
+                            + ", got " + lag + ". V3 will invert this.");
         }
     }
 
     private long measureLag() throws Exception {
         try (AdminClient admin = adminClient()) {
-            // Committed offsets for this group.
             Map<TopicPartition, OffsetAndMetadata> committed = admin
                     .listConsumerGroupOffsets(groupId)
                     .partitionsToOffsetAndMetadata()
                     .get(10, TimeUnit.SECONDS);
 
-            // End offsets across the partitions of orderTopic.
             Map<TopicPartition, OffsetSpec> req = new HashMap<>();
             for (int p = 0; p < 3; p++) req.put(new TopicPartition(orderTopic, p), OffsetSpec.latest());
             Map<TopicPartition, ListOffsetsResultInfo> end = admin.listOffsets(req).all().get(10, TimeUnit.SECONDS);

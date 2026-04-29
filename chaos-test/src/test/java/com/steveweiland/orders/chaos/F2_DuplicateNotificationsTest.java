@@ -4,10 +4,9 @@ import com.steveweiland.orders.api.OrderProducer;
 import com.steveweiland.orders.common.Order;
 import com.steveweiland.orders.common.OrderFulfilled;
 import com.steveweiland.orders.common.OrderItem;
-import com.steveweiland.orders.fulfillment.EventProducer;
-import com.steveweiland.orders.fulfillment.FulfillmentConsumer;
-import com.steveweiland.orders.fulfillment.FulfillmentStore;
-import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.TopicPartition;
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -15,46 +14,32 @@ import org.junit.jupiter.api.Test;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
- * F2 — Duplicate notifications after consumer crash (spec.md §6 F2)
+ * F2 — Duplicate notifications after consumer crash. (spec.md §6 F2)
  *
- * V1 baseline: PASSES by asserting the bug.
- * Mechanism: disable auto-commit on the first run so the offset is never
- * advanced. (Production V1 has auto-commit=true, but the BUG is the window
- * between work-completion and the next commit tick. Disabling the commit
- * deterministically reproduces the post-crash broker state — uncommitted
- * offset — without racing the 5 s tick.) On restart with the same group.id,
- * the original record is redelivered → second OrderFulfilled.
+ * V1 asserted 2 events (uncommitted offset → redelivery on restart). V2 asserts 1:
+ * the first run successfully writes to {@code processed_orders} and {@code outbox}
+ * in a single DB transaction; the relay publishes; the redelivered record on
+ * restart is detected by the idempotency check and skipped.
  *
- * V2 expectation: with a transactional outbox (state + offset committed
- * atomically), restart will not redeliver. assertEquals 1.
+ * Test mechanism: after the first run, manually reset the consumer-group offset
+ * back to 0 (simulating "the V2 consumer crashed before its commitSync"). On
+ * restart the record is redelivered and the idempotency table catches it.
  */
 @Tag("chaos")
 class F2_DuplicateNotificationsTest extends KafkaTestFixture {
 
     @Test
-    void consumerCrashBeforeCommitCausesDuplicateEvent() throws Exception {
+    void redeliveryAfterCrashIsAbsorbedByIdempotency() throws Exception {
         OrderProducer producer = new OrderProducer(bootstrap(), orderTopic);
-
-        // Suppress all commits on the first run so the broker's __consumer_offsets
-        // for this group stays at 0. KafkaConsumer.close() also commits when auto-commit
-        // is enabled, so set it to false explicitly.
-        Map<String, Object> noCommit = Map.of(
-                ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
-
-        FulfillmentStore store = new FulfillmentStore();
-        EventProducer eventProducer1 = new EventProducer(bootstrap(), eventTopic);
-        FulfillmentConsumer firstRun = new FulfillmentConsumer(
-                bootstrap(), orderTopic, groupId, noCommit, eventProducer1, store);
-
-        Thread worker1 = new Thread(firstRun, "fulfillment-run-1");
-
         Order order = new Order(
                 UUID.randomUUID().toString(),
                 "cust-f2",
@@ -63,43 +48,35 @@ class F2_DuplicateNotificationsTest extends KafkaTestFixture {
                 Instant.now());
         producer.send(order);
 
-        worker1.start();
-        try {
-            // Wait until the first fulfillment event lands.
+        // First run: process the record + emit to outbox + relay publishes.
+        try (V2Stack first = new V2Stack(bootstrap(), orderTopic, eventTopic, dlqTopic,
+                groupId, Map.of(), dataSource())) {
+            first.start();
             Awaitility.await()
                     .atMost(Duration.ofSeconds(15))
-                    .until(() -> TopicTailer.drain(bootstrap(), eventTopic, OrderFulfilled.class,
-                            Duration.ofMillis(500)).size() >= 1);
-        } finally {
-            firstRun.stop();
-            worker1.join(10_000);
-            eventProducer1.close();
+                    .until(() -> !TopicTailer.drain(bootstrap(), eventTopic, OrderFulfilled.class,
+                            Duration.ofMillis(500)).isEmpty());
         }
 
-        // Restart with the SAME group.id. Since auto-commit never fired, the consumer
-        // resumes from the previous (zero) offset and redelivers the same record.
-        EventProducer eventProducer2 = new EventProducer(bootstrap(), eventTopic);
-        FulfillmentConsumer secondRun = new FulfillmentConsumer(
-                bootstrap(), orderTopic, groupId, Map.of(), eventProducer2, store);
+        // Simulate the V1 race: consumer crashed AFTER work but BEFORE commitSync.
+        // We achieve this by rewinding the committed offset to 0 for this group.
+        try (AdminClient admin = adminClient()) {
+            Map<TopicPartition, OffsetAndMetadata> rewind = new HashMap<>();
+            for (int p = 0; p < 3; p++) rewind.put(new TopicPartition(orderTopic, p), new OffsetAndMetadata(0));
+            admin.alterConsumerGroupOffsets(groupId, rewind).all().get(10, TimeUnit.SECONDS);
+        }
 
-        Thread worker2 = new Thread(secondRun, "fulfillment-run-2");
-        worker2.start();
-        try {
-            Awaitility.await()
-                    .atMost(Duration.ofSeconds(15))
-                    .until(() -> TopicTailer.drain(bootstrap(), eventTopic, OrderFulfilled.class,
-                            Duration.ofMillis(500)).size() >= 2);
+        // Second run: the original record is redelivered. V2 idempotency check skips it.
+        try (V2Stack second = new V2Stack(bootstrap(), orderTopic, eventTopic, dlqTopic,
+                groupId, Map.of(), dataSource())) {
+            second.start();
+            Thread.sleep(3000);
 
             List<OrderFulfilled> events = TopicTailer.drain(bootstrap(), eventTopic,
                     OrderFulfilled.class, Duration.ofSeconds(2));
-
-            // V1: TWO events for ONE logical order due to redelivery. V2 will assert 1.
-            assertEquals(2, events.size(),
-                    "V1 baseline: redelivery causes a second OrderFulfilled event");
+            assertEquals(1, events.size(),
+                    "V2 fix: idempotency check absorbs redelivery; exactly one event");
         } finally {
-            secondRun.stop();
-            worker2.join(10_000);
-            eventProducer2.close();
             producer.close();
         }
     }

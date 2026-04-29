@@ -8,9 +8,12 @@ public final class NotificationApp {
 
     private NotificationApp() {}
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
         String bootstrap = strFlag(args, "--bootstrap-servers",
                 System.getenv().getOrDefault("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"));
+
+        com.steveweiland.orders.common.topics.TopicAdmin.ensure(bootstrap, java.util.List.of(
+                new org.apache.kafka.clients.admin.NewTopic("order-events", 3, (short) 1)));
 
         NotificationConsumer consumer = new NotificationConsumer(bootstrap);
         Thread worker = new Thread(consumer, "notification-consumer");

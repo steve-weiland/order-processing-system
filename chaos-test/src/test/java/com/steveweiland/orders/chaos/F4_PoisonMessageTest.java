@@ -4,12 +4,15 @@ import com.steveweiland.orders.api.OrderProducer;
 import com.steveweiland.orders.common.Order;
 import com.steveweiland.orders.common.OrderFulfilled;
 import com.steveweiland.orders.common.OrderItem;
-import com.steveweiland.orders.fulfillment.EventProducer;
-import com.steveweiland.orders.fulfillment.FulfillmentConsumer;
-import com.steveweiland.orders.fulfillment.FulfillmentStore;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.awaitility.Awaitility;
@@ -20,35 +23,36 @@ import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * F4 — Poison message stalls the partition (spec.md §6 F4)
+ * F4 — Poison message. (spec.md §6 F4)
  *
- * V1 baseline: PASSES by asserting the bug.
- * Mechanism: write a malformed JSON byte string to a single partition of the
- * orders topic, then write a valid order to the SAME partition (using the
- * same key so partitioning is deterministic). The consumer hits the poison
- * record first, throws SerializationException out of poll(), and terminates.
- * The valid record is never processed.
+ * V1: deserialization exception killed the consumer thread; valid record
+ * behind it stalled (asserted 0 valid events + consumer crashed).
  *
- * V2 expectation: with a DLQ, the poison record is routed to `orders.dlq`
- * after N retries and the consumer skips past it. assertEquals 1 valid
- * fulfillment event, and the consumer is still alive.
+ * V2: consumer reads as {@code byte[]}, parses JSON manually; on parse
+ * failure, the raw bytes go to {@code orders.dlq} with diagnostic headers
+ * and the source offset is committed. The valid record behind the poison
+ * is processed normally.
  */
 @Tag("chaos")
 class F4_PoisonMessageTest extends KafkaTestFixture {
 
     @Test
-    void malformedJsonCrashesConsumerAndStallsPartition() throws Exception {
-        // Step 1: write the poison record on a deterministic key.
-        String poisonKey = "poison-key";
+    void poisonMessageRoutedToDlqAndConsumerContinues() throws Exception {
+        // Use a real UUID for the partitioning key so the valid order behind the
+        // poison record (which uses the same key for same-partition placement) has
+        // a UUID-shaped orderId — the schema's order_id column requires UUID.
+        String poisonKey = UUID.randomUUID().toString();
         byte[] poison = "{not valid json".getBytes(StandardCharsets.UTF_8);
 
         Properties rawProps = new Properties();
@@ -59,7 +63,6 @@ class F4_PoisonMessageTest extends KafkaTestFixture {
             raw.send(new ProducerRecord<>(orderTopic, poisonKey, poison)).get();
         }
 
-        // Step 2: write a valid order on the SAME key — same partition, after the poison.
         OrderProducer producer = new OrderProducer(bootstrap(), orderTopic);
         Order valid = new Order(
                 poisonKey,
@@ -69,35 +72,68 @@ class F4_PoisonMessageTest extends KafkaTestFixture {
                 Instant.now());
         producer.send(valid);
 
-        // Step 3: start the consumer. It will poll, hit the poison record, and crash.
-        EventProducer eventProducer = new EventProducer(bootstrap(), eventTopic);
-        FulfillmentStore store = new FulfillmentStore();
-        FulfillmentConsumer consumer = new FulfillmentConsumer(
-                bootstrap(), orderTopic, groupId, Map.of(), eventProducer, store);
+        try (V2Stack stack = new V2Stack(bootstrap(), orderTopic, eventTopic, dlqTopic,
+                groupId, Map.of(), dataSource())) {
+            stack.start();
 
-        Thread worker = new Thread(consumer, "fulfillment-f4");
-        worker.setUncaughtExceptionHandler((t, e) -> { /* expected — swallow */ });
-        worker.start();
-
-        try {
+            // Wait for the valid record's event to surface.
             Awaitility.await()
                     .atMost(Duration.ofSeconds(15))
-                    .pollInterval(Duration.ofMillis(200))
-                    .until(consumer::crashed);
+                    .until(() -> !TopicTailer.drain(bootstrap(), eventTopic, OrderFulfilled.class,
+                            Duration.ofMillis(500)).isEmpty());
 
-            // The consumer thread terminated; the valid record was never processed.
             List<OrderFulfilled> events = TopicTailer.drain(bootstrap(), eventTopic,
                     OrderFulfilled.class, Duration.ofSeconds(2));
+            List<DlqRecord> dlq = drainDlq();
 
-            assertTrue(consumer.crashed(),
-                    "V1 baseline: consumer must terminate on poison message");
-            assertEquals(0, events.size(),
-                    "V1 baseline: valid order behind the poison record is never fulfilled");
+            assertFalse(stack.consumer.crashed(),
+                    "V2 fix: consumer no longer crashes on poison");
+            assertEquals(1, events.size(),
+                    "V2 fix: valid order behind poison is fulfilled normally");
+            assertEquals(valid.orderId(), events.get(0).orderId());
+            assertEquals(1, dlq.size(),
+                    "V2 fix: poison record routed to DLQ");
+            DlqRecord d = dlq.get(0);
+            assertTrue(d.headers.containsKey("x-dlq-reason"), "DLQ record missing x-dlq-reason");
+            assertEquals(orderTopic, d.headers.get("x-dlq-source-topic"),
+                    "DLQ record missing or wrong x-dlq-source-topic");
+            assertTrue(d.headers.containsKey("x-dlq-source-partition"));
+            assertTrue(d.headers.containsKey("x-dlq-source-offset"));
         } finally {
-            consumer.stop();
-            worker.join(10_000);
             producer.close();
-            eventProducer.close();
         }
     }
+
+    private List<DlqRecord> drainDlq() {
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap());
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "dlq-tail-" + UUID.randomUUID());
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+
+        List<DlqRecord> out = new ArrayList<>();
+        try (KafkaConsumer<byte[], byte[]> c = new KafkaConsumer<>(props,
+                new ByteArrayDeserializer(), new ByteArrayDeserializer())) {
+            c.subscribe(List.of(dlqTopic));
+            long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+            int emptyPolls = 0;
+            while (System.nanoTime() < deadline) {
+                ConsumerRecords<byte[], byte[]> batch = c.poll(Duration.ofMillis(200));
+                if (batch.isEmpty()) {
+                    if (++emptyPolls >= 3 && !out.isEmpty()) break;
+                    continue;
+                }
+                for (ConsumerRecord<byte[], byte[]> rec : batch) {
+                    var hMap = new java.util.HashMap<String, String>();
+                    for (Header h : rec.headers()) {
+                        hMap.put(h.key(), new String(h.value(), StandardCharsets.UTF_8));
+                    }
+                    out.add(new DlqRecord(rec.key(), rec.value(), hMap));
+                }
+            }
+        }
+        return out;
+    }
+
+    private record DlqRecord(byte[] key, byte[] value, Map<String, String> headers) {}
 }

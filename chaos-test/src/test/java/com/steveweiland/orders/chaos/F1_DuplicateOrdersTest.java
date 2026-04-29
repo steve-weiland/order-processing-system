@@ -4,9 +4,6 @@ import com.steveweiland.orders.api.OrderProducer;
 import com.steveweiland.orders.common.Order;
 import com.steveweiland.orders.common.OrderFulfilled;
 import com.steveweiland.orders.common.OrderItem;
-import com.steveweiland.orders.fulfillment.EventProducer;
-import com.steveweiland.orders.fulfillment.FulfillmentConsumer;
-import com.steveweiland.orders.fulfillment.FulfillmentStore;
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -21,32 +18,22 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
- * F1 — Duplicate orders (spec.md §6 F1)
+ * F1 — Duplicate orders. (spec.md §6 F1)
  *
- * V1 baseline: this test PASSES by asserting the bug. A client retry produces
- * two records on `orders`, which become two `OrderFulfilled` events.
- *
- * V2 expectation: this test will be inverted (assertEquals 1) once an
- * idempotency-key table is in place. Do not "fix" this test in V1 — its job
- * is to lock in the V1 broken behavior so the V2 diff is unambiguous.
+ * V1 asserted 2 events. V2 asserts 1 event: the {@code processed_orders}
+ * idempotency check in {@link com.steveweiland.orders.fulfillment.FulfillmentConsumer}
+ * absorbs the duplicate before any second outbox row is inserted.
  */
 @Tag("chaos")
 class F1_DuplicateOrdersTest extends KafkaTestFixture {
 
     @Test
-    void clientRetryCausesDuplicateFulfillmentEvent() throws Exception {
+    void clientRetryProducesSingleFulfillmentEvent() throws Exception {
         OrderProducer producer = new OrderProducer(bootstrap(), orderTopic);
-        EventProducer eventProducer = new EventProducer(bootstrap(), eventTopic);
-        FulfillmentStore store = new FulfillmentStore();
-        FulfillmentConsumer consumer = new FulfillmentConsumer(
-                bootstrap(), orderTopic, groupId, Map.of(), eventProducer, store);
+        try (V2Stack stack = new V2Stack(bootstrap(), orderTopic, eventTopic, dlqTopic,
+                groupId, Map.of(), dataSource())) {
+            stack.start();
 
-        Thread worker = new Thread(consumer, "fulfillment-test");
-        worker.start();
-
-        try {
-            // One logical order, sent twice — simulates the "POST /orders timed out, client retried"
-            // path where the same payload reaches the broker twice with the same orderId.
             Order order = new Order(
                     UUID.randomUUID().toString(),
                     "cust-f1",
@@ -57,25 +44,24 @@ class F1_DuplicateOrdersTest extends KafkaTestFixture {
             producer.send(order);
             producer.send(order);
 
+            // Wait for the relay to publish at least one event.
             Awaitility.await()
                     .atMost(Duration.ofSeconds(15))
                     .pollInterval(Duration.ofMillis(200))
-                    .until(() -> TopicTailer.drain(bootstrap(), eventTopic, OrderFulfilled.class,
-                            Duration.ofMillis(500)).size() >= 2);
+                    .until(() -> !TopicTailer.drain(bootstrap(), eventTopic, OrderFulfilled.class,
+                            Duration.ofMillis(500)).isEmpty());
+
+            // Give the second delivery time to be processed (and rejected by idempotency).
+            Thread.sleep(2000);
 
             List<OrderFulfilled> events = TopicTailer.drain(bootstrap(), eventTopic,
                     OrderFulfilled.class, Duration.ofSeconds(2));
 
-            // V1: TWO events for ONE logical order. V2 will assert 1.
-            assertEquals(2, events.size(),
-                    "V1 baseline: two notifications expected for one duplicate-sent order");
+            assertEquals(1, events.size(),
+                    "V2 fix: idempotency check absorbs the duplicate; exactly one event");
             assertEquals(order.orderId(), events.get(0).orderId());
-            assertEquals(order.orderId(), events.get(1).orderId());
         } finally {
-            consumer.stop();
-            worker.join(10_000);
             producer.close();
-            eventProducer.close();
         }
     }
 }

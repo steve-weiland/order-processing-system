@@ -5,7 +5,6 @@ services:
     ports:
       - "9092:9092"
     environment:
-      # KRaft single-node (combined controller + broker)
       KAFKA_NODE_ID: "0"
       KAFKA_PROCESS_ROLES: "controller,broker"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "0@localhost:9094"
@@ -15,13 +14,28 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
       KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
       KAFKA_NUM_PARTITIONS: "3"
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      # Reduce the size of the __consumer_offsets topic for single-node dev
+      # V2: services own their topics; do NOT auto-create from producer/consumer requests.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: ops-postgres
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: orders
+    ports:
+      - "6432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders -d orders"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -34,9 +48,14 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     environment:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9093"
       ORDER_API_PORT: "6080"
+      JDBC_URL: "jdbc:postgresql://postgres:5432/orders"
+      JDBC_USER: "orders"
+      JDBC_PASSWORD: "orders"
     ports:
       - "6080:6080"
 
@@ -48,8 +67,14 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     environment:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9093"
+      JDBC_URL: "jdbc:postgresql://postgres:5432/orders"
+      JDBC_USER: "orders"
+      JDBC_PASSWORD: "orders"
+      OUTBOX_POLL_MS: "100"
 
   notification-service:
     build:

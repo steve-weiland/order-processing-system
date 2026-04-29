@@ -26,10 +26,8 @@ public final class OrderProducer implements AutoCloseable {
         Properties props = new Properties();
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ProducerConfig.CLIENT_ID_CONFIG, "order-api");
-        props.put(ProducerConfig.ACKS_CONFIG, "1");
-        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, false);
-        props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 10_000);
-        props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 5_000);
+        props.put(ProducerConfig.ACKS_CONFIG, "all");
+        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
         this.producer = new KafkaProducer<>(props, new StringSerializer(), new JsonSerializer<>());
         this.topic = topic;
     }

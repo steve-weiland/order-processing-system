@@ -6,6 +6,8 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.slf4j.Logger;
@@ -40,8 +42,7 @@ public final class NotificationConsumer implements Runnable, AutoCloseable {
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
         props.put(ConsumerConfig.CLIENT_ID_CONFIG, "notification-service");
-        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, true);
-        props.put(ConsumerConfig.AUTO_COMMIT_INTERVAL_MS_CONFIG, 5_000);
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
         props.putAll(overrides);
 
@@ -63,6 +64,9 @@ public final class NotificationConsumer implements Runnable, AutoCloseable {
                 ConsumerRecords<String, OrderFulfilled> batch = consumer.poll(Duration.ofMillis(1000));
                 for (ConsumerRecord<String, OrderFulfilled> rec : batch) {
                     notifyOne(rec.value(), rec.partition(), rec.offset());
+                    consumer.commitSync(Map.of(
+                            new TopicPartition(rec.topic(), rec.partition()),
+                            new OffsetAndMetadata(rec.offset() + 1)));
                 }
             }
         } catch (WakeupException e) {

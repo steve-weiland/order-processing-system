@@ -1,36 +1,120 @@
-# Order Processing System — V1
+# Order Processing System
 
-Event-driven order pipeline built on Java 21 + Apache Kafka. **V1 is deliberately
-naive** to expose the failure modes that V2 will fix: producer-retry duplicates,
-consumer-crash duplicate notifications, poison messages that stall partitions, and
-consumer lag under load.
+Event-driven order pipeline on **Java 21 + Apache Kafka + Postgres**, built to
+demonstrate the V1 → V2 transition that turns a naive at-most-once pipeline
+into one with **effectively-once** delivery semantics.
 
-Full spec: [`spec.md`](./spec.md).
+V1 was deliberately broken in five well-known ways. V2 fixes four of them with
+three mechanisms: an **idempotency key table**, a **transactional outbox**, and
+a **dead letter queue**. Each fix is locked in by a deterministic chaos test
+whose assertion was inverted across the V1 → V2 commit boundary — that diff is
+the portfolio artifact.
+
+| | |
+|--|--|
+| **Spec** | [`spec.md`](./spec.md) — RFC-2119 requirements, V1/V2 mapping |
+| **Chaos report** | [`docs/chaos-report.md`](./docs/chaos-report.md) — V1 baseline → V2 fix per failure |
+| **Status** | V2 (4/5 failure modes resolved). F5 deferred to V3. |
 
 ---
 
-## Architecture
+## Architecture (V2)
 
+```mermaid
+flowchart LR
+    client([HTTP client]) -- POST /orders --> api[order-api<br/>Javalin :6080<br/>Idempotency-Key dedup]
+    api -- producer --> orders[(orders<br/>Kafka topic)]
+    orders -- consume --> ful[fulfillment-service<br/>byte&#91;&#93; deserialize]
+    ful -- parse OK --> idemp{processed_orders<br/>idempotency check}
+    idemp -- new --> tx[[DB tx:<br/>INSERT processed_orders<br/>+ INSERT outbox]]
+    idemp -- seen --> skip[[skip — commit offset]]
+    tx --> commit[commitSync offset]
+    ful -- parse FAIL --> dlq[(orders.dlq<br/>+ diagnostic headers)]
+    relay[outbox-relay thread<br/>idempotent producer] -- poll --> outbox[(outbox table)]
+    relay -- publish --> events[(order-events<br/>Kafka topic)]
+    relay -- mark published --> outbox
+    events --> notif[notification-service<br/>manual commit]
+    notif -- log --> stdout([stdout])
+    api -.- pg[(Postgres<br/>processed_orders<br/>outbox<br/>idempotency_keys)]
+    ful -.- pg
+    tx -.-> outbox
+    pg --- relay
 ```
-client ──POST /orders──▶ order-api ──▶ [orders] ──▶ fulfillment-service ──▶ [order-events] ──▶ notification-service
-                                                          │
-                                                          └─ in-memory fulfilled-order map
+
+| Service | Stack | Role |
+|---------|-------|------|
+| `order-api` | Java 21, Javalin, kafka-clients, JDBC | HTTP producer on `:6080`; optional `Idempotency-Key` header for HTTP-layer dedup |
+| `fulfillment-service` | Java 21, kafka-clients, Postgres + outbox-relay thread | Idempotent consumer; atomic state + outbox in one DB tx; manual `commitSync` only after tx commits; routes parse failures to DLQ |
+| `notification-service` | Java 21, kafka-clients | Consumer with manual commit; logs notifications |
+| `kafka` | `apache/kafka:3.8.1` KRaft | Single-node broker, 3 partitions per topic, `auto.create.topics.enable=false` |
+| `postgres` | `postgres:16-alpine` | Three Flyway-managed tables: `processed_orders`, `outbox`, `idempotency_keys` |
+
+---
+
+## What broke and how it was fixed
+
+The V1 → V2 story, with the failing chaos test that drove each fix.
+
+| # | V1 bug | Mechanism in V2 | Test (inverted V1 → V2) |
+|---|--------|-----------------|------------------------|
+| F1 | A client retry on `POST /orders` produced **2** records on `orders` and **2** notifications. | `processed_orders` lookup before any work; `Idempotency-Key` header for HTTP-layer dedup. | `F1_DuplicateOrdersTest` — flipped from `assertEquals(2, …)` to `assertEquals(1, …)`. |
+| F2 | A consumer crash before the next auto-commit tick caused **redelivery** → second notification. | `enable.auto.commit=false` + `commitSync` after DB tx; redelivery hits the idempotency check and is skipped. | `F2_DuplicateNotificationsTest` — flipped from 2 → 1. |
+| F3 | Auto-commit advanced the offset before work completed → record **lost** on restart. | DB tx is the durability gate; `commitSync` runs only after `COMMIT` succeeds. | `F3_LostOrdersTest` — flipped from `assertEquals(0, …)` to `assertEquals(1, …)`. |
+| F4 | Malformed JSON crashed the consumer thread; the partition stalled. | Read as `byte[]`, parse manually; on parse failure, publish raw bytes to `orders.dlq` with diagnostic headers, commit the source offset, continue. | `F4_PoisonMessageTest` — flipped to assert `!consumer.crashed()`, valid event = 1, DLQ size = 1, headers populated. |
+| F5 | Single-thread × 50 ms / record → lag grew linearly under burst. | **Not addressed in V2** (correctness vs throughput). | `F5_ConsumerLagTest` — assertion unchanged: `lag > 200`. V3 will invert. |
+
+Run the suite and watch the numbers come out:
+
+```bash
+$ make chaos
+[INFO] Tests run: 1, in F1_DuplicateOrdersTest                Time: 4.9s   PASS
+[INFO] Tests run: 1, in F2_DuplicateNotificationsTest         Time: 8.7s   PASS
+[INFO] Tests run: 1, in F3_LostOrdersTest                     Time: 2.3s   PASS
+[INFO] Tests run: 1, in F4_PoisonMessageTest                  Time: 3.8s   PASS
+[INFO] Tests run: 1, in F5_ConsumerLagTest                    Time: 2.5s   PASS
+
+=== chaos-test/target/lag-v2.txt ===
+burst=500 window=2s lag=469
 ```
 
-| Service | Language | Role | Topic in / out |
-|---------|----------|------|---------------|
-| `order-api` | Java 21 + Javalin | HTTP producer (:6080) | — / `orders` |
-| `fulfillment-service` | Java 21 + kafka-clients | Consumer → producer | `orders` / `order-events` |
-| `notification-service` | Java 21 + kafka-clients | Consumer (log only) | `order-events` / — |
-| `kafka` | `apache/kafka:3.8.1` KRaft | Single-node broker, 3 partitions per topic | |
+For a deeper walkthrough of each test, the V1 baseline numbers, and the actual
+DLQ payloads captured during a run, see [`docs/chaos-report.md`](./docs/chaos-report.md).
 
-V1 design points intentionally missing idempotency (see §3.4, §6 of the spec):
+---
 
-- `enable.auto.commit=true` on both consumers
-- No idempotency key table
-- No DLQ for poison messages
-- No transactional outbox
-- Fulfillment store is an in-memory `Map` (lost on restart)
+## Why this design
+
+**Outbox vs Kafka native transactions.** Kafka's `initTransactions()` API can
+atomically commit producer sends and consumer offsets, but it does so against
+Kafka, not against Postgres. As soon as the application has *durable state*
+(processed_orders), there's nothing tying that state to the Kafka offset.
+DB-backed outbox flips this: the DB transaction is the source of truth, the
+relay republishes if it crashes mid-publish, and consumer-side idempotency
+absorbs the duplicates. **Kafka becomes at-least-once; correctness lives in
+Postgres.**
+
+**In-process relay vs sidecar.** The outbox relay runs as a thread inside the
+fulfillment-service JVM, sharing its connection pool. A separate process would
+be cleaner architecturally but introduces deployment coupling, leader election,
+and an extra failure mode. Kept in-process for V2; revisit if multi-instance
+fulfillment becomes necessary.
+
+**Two layers of idempotency.** The `Idempotency-Key` header (HTTP layer) and
+`processed_orders` lookup (consumer layer) overlap. Both stay because they
+defend against different failure modes: HTTP retries that the broker never
+sees vs Kafka redelivery that the order-api never sees. Removing either
+opens a duplicate window.
+
+**Straight-to-DLQ on first parse failure.** Production-grade systems retry N
+times before giving up. V2 doesn't — a JSON parse failure is structural, not
+transient, and infinite retries would still fail. The retry topic is a V3
+hardening pass.
+
+**Why F5 stays unfixed in V2.** Consumer lag is a throughput concern; V2's
+charter is correctness. Fixing F5 (parallel consumer, `max.poll.records`
+tuning) without first proving that V2 doesn't lose or duplicate orders would
+mean two unrelated changes interleaved. V3 will treat throughput as its own
+axis.
 
 ---
 
@@ -39,49 +123,72 @@ V1 design points intentionally missing idempotency (see §3.4, §6 of the spec):
 ### Everything in Docker
 
 ```bash
-make run            # docker compose up --build
-make send-order     # POST a sample order
-make logs           # tail all three services
+make run                                       # docker compose up --build
+curl -X POST http://localhost:6080/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customerId":"alice","items":[{"sku":"SKU-A","quantity":1,"unitPrice":9.99}]}'
+# → {"orderId":"<uuid>"}
 ```
 
-Expected timeline (one order):
-
-```
-order-api           "order accepted customerId=cust-demo total=24.48" orderId=<uuid>
-fulfillment-service "fulfilling customerId=cust-demo partition=? offset=?" orderId=<uuid>
-fulfillment-service "fulfilled storeSize=1" orderId=<uuid>
-notification-service "Notification sent for order=<uuid> customer=cust-demo ..." orderId=<uuid>
-```
-
-### Kafka in Docker, services on host
+Demonstrate idempotency-key replay:
 
 ```bash
-make run-kafka                                # starts broker on localhost:9092
-mvn -DskipTests package                       # build shaded jars
+KEY=$(uuidgen)
+curl -X POST http://localhost:6080/orders -H "Idempotency-Key: $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"customerId":"bob","items":[{"sku":"SKU-B","quantity":1,"unitPrice":4.50}]}'
+# → {"orderId":"abc-123"}
+
+# replay — same key, same payload, returns SAME orderId; no Kafka record produced
+curl -X POST http://localhost:6080/orders -H "Idempotency-Key: $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"customerId":"bob","items":[{"sku":"SKU-B","quantity":1,"unitPrice":4.50}]}'
+# → {"orderId":"abc-123"}
+```
+
+Demonstrate the DLQ:
+
+```bash
+echo 'not-valid-json' | docker exec -i ops-kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic orders
+
+make consume-dlq      # poison appears with x-dlq-* headers
+docker compose ps     # fulfillment-service still up
+```
+
+### Kafka + Postgres in Docker, services on host
+
+```bash
+make run-local        # starts kafka + postgres
+mvn -DskipTests package
 java -jar order-api/target/order-api.jar &
 java -jar fulfillment-service/target/fulfillment-service.jar &
 java -jar notification-service/target/notification-service.jar &
 ```
 
-### CLI flags
-
-```
-order-api              --port <int>              (default 6080)
-                       --bootstrap-servers <str> (default localhost:9092)
-fulfillment-service    --bootstrap-servers <str> (default localhost:9092)
-notification-service   --bootstrap-servers <str> (default localhost:9092)
-```
-
-Environment equivalents: `ORDER_API_PORT`, `KAFKA_BOOTSTRAP_SERVERS`.
-
 ---
 
-## Inspect Kafka
+## Inspect
 
 ```bash
-make topics          # list topics
-make consume-orders  # stream raw orders topic
-make consume-events  # stream raw order-events topic
+make topics          # list Kafka topics
+make consume-orders  # stream the orders topic
+make consume-events  # stream order-events
+make consume-dlq     # stream orders.dlq with headers
+make psql            # interactive Postgres
+```
+
+Useful queries against the running Postgres:
+
+```sql
+-- fulfilled orders
+SELECT order_id, customer_id, fulfilled_at FROM processed_orders ORDER BY fulfilled_at;
+
+-- outbox progress (published_at NULL means relay hasn't sent yet)
+SELECT id, topic, published_at IS NOT NULL AS published FROM outbox ORDER BY id;
+
+-- idempotency keys (24 h TTL by convention; not auto-reaped in V2)
+SELECT key, order_id, created_at FROM idempotency_keys ORDER BY created_at DESC;
 ```
 
 ---
@@ -90,54 +197,50 @@ make consume-events  # stream raw order-events topic
 
 ```bash
 make build    # mvn compile
-make test     # mvn test (unit tests only — no broker required)
-make chaos    # mvn -P chaos test (Testcontainers spins up Kafka; runs F1-F5)
-make package  # produce shaded jars in each service's target/
+make test     # unit tests only — no broker, ~1s
+make chaos    # Testcontainers + Kafka + Postgres, runs F1-F5, ~25s
+make package  # shaded jars in each service's target/
 make clean    # mvn clean + docker compose down -v
 ```
 
-The chaos suite (`chaos-test/`) is opt-in via the `chaos` Maven profile so the
-unit-test loop stays fast (~1s). It uses Testcontainers + `apache/kafka:3.8.1`
-and runs in ~35s.
+The chaos suite is opt-in via the `chaos` Maven profile to keep the
+unit-test loop fast.
 
 ---
 
-## V1 failure modes
+## Project layout
 
-Each failure mode in `spec.md` §6 has a deterministic chaos test in
-`chaos-test/src/test/java/com/steveweiland/orders/chaos/`. **Each test asserts the
-V1 buggy behavior.** When V2 lands, the assertions invert — the diff itself is
-the portfolio asset.
-
-| # | Failure | Test class | V1 asserts | V2 will assert |
-|---|---------|------------|------------|---------------|
-| F1 | Duplicate orders | `F1_DuplicateOrdersTest` | 2 events for 1 logical order | 1 event (idempotency-key table) |
-| F2 | Duplicate notifications | `F2_DuplicateNotificationsTest` | redelivery on restart → 2 events | 1 event (transactional outbox) |
-| F3 | Lost orders | `F3_LostOrdersTest` | record skipped after pre-committed offset → 0 events | 1 event (manual commitSync after work) |
-| F4 | Poison message | `F4_PoisonMessageTest` | consumer crashes; partition stalled → 0 valid events | 1 event (DLQ routes the poison) |
-| F5 | Consumer lag | `F5_ConsumerLagTest` | lag > 200 records after 2s burst | lag near 0 (parallel consumer / tuning) |
-
-`make chaos` runs the suite and prints `chaos-test/target/lag-v1.txt` — the F5
-baseline number that V2 will need to beat.
-
-V2 chaos report will combine these test outputs with Kafka lag graphs + DLQ
-contents captured during the V2 implementation.
+```
+order-processing-system/
+├── spec.md                         RFC-2119 spec, V1 → V2 mapping
+├── docs/chaos-report.md            Detailed V1 baseline vs V2 fix per failure mode
+├── docker-compose.yml              kafka + postgres + 3 services
+├── Makefile
+├── pom.xml                         parent (Java 21, dep management)
+├── common/                         shared DTOs, JSON serde, DB helpers, Flyway, TopicAdmin
+│   └── src/main/resources/db/migration/   V{1,2,3}__*.sql
+├── order-api/                      HTTP → Kafka, Idempotency-Key
+├── fulfillment-service/            consumer + outbox relay + DLQ
+├── notification-service/           consumer + log
+└── chaos-test/                     F1-F5 chaos tests (opt-in, profile=chaos)
+```
 
 ---
 
-## What's next (V2)
+## What's next (V3)
 
-- Idempotent producer + client idempotency key → fixes F1
-- Transactional outbox → fixes F2
-- Manual `commitSync` after work → fixes F3
-- Dead letter queue → fixes F4
-- `max.poll.records` tuning + parallel consumer → fixes F5
-- Saga pattern (payment → inventory → ship) — stretch
+- **F5** — parallel consumer or `max.poll.records` tuning to drain the lag baseline
+- **Notification-side idempotency** — closes the relay-crash duplicate-publish window left open by V2's at-least-once relay
+- **Retry-before-DLQ** — separate retry topic with bounded attempts
+- **Distributed outbox relay** — leader election; multi-instance deployment
+- **Saga pattern** — payment → inventory → ship with compensating actions
+- **Schema registry** — Avro or Protobuf
 
 ---
 
 ## Reading
 
-- Kleppmann, *Designing Data-Intensive Applications* — chapters 11–12 (stream processing, consistency & consensus)
+- Kleppmann, *Designing Data-Intensive Applications* — chapters 11–12
 - Confluent — *Exactly Once Semantics Are Possible: Here's How Kafka Does It*
-- Chris Richardson — *Pattern: Saga*
+- Chris Richardson — *Pattern: Transactional Outbox*, *Pattern: Saga*
+- Microsoft — *Asynchronous request-reply / Idempotency Key* docs

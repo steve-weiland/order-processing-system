@@ -38,6 +38,9 @@
         <junit.version>5.11.3</junit.version>
         <testcontainers.version>1.20.4</testcontainers.version>
         <awaitility.version>4.2.2</awaitility.version>
+        <postgresql.version>42.7.4</postgresql.version>
+        <hikaricp.version>5.1.0</hikaricp.version>
+        <flyway.version>10.20.1</flyway.version>
 
         <maven-compiler.version>3.13.0</maven-compiler.version>
         <maven-surefire.version>3.5.1</maven-surefire.version>
@@ -104,6 +107,27 @@
                 <version>${testcontainers.version}</version>
                 <type>pom</type>
                 <scope>import</scope>
+            </dependency>
+
+            <dependency>
+                <groupId>org.postgresql</groupId>
+                <artifactId>postgresql</artifactId>
+                <version>${postgresql.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.zaxxer</groupId>
+                <artifactId>HikariCP</artifactId>
+                <version>${hikaricp.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.flywaydb</groupId>
+                <artifactId>flyway-core</artifactId>
+                <version>${flyway.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.flywaydb</groupId>
+                <artifactId>flyway-database-postgresql</artifactId>
+                <version>${flyway.version}</version>
             </dependency>
 
             <dependency>

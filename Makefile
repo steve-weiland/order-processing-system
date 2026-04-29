@@ -1,4 +1,4 @@
-.PHONY: build test chaos package run run-local run-kafka logs stop clean order send-order topics
+.PHONY: build test chaos package run run-local run-kafka run-postgres logs stop clean order send-order topics psql
 
 build:
 	mvn -ntp compile
@@ -9,8 +9,8 @@ test:
 chaos:
 	mvn -ntp -P chaos -pl chaos-test -am test
 	@echo
-	@echo '=== chaos-test/target/lag-v1.txt ==='
-	@cat chaos-test/target/lag-v1.txt 2>/dev/null || echo '(not produced — F5 may have failed)'
+	@echo '=== chaos-test/target/lag-v2.txt ==='
+	@cat chaos-test/target/lag-v2.txt 2>/dev/null || echo '(not produced — F5 may have failed)'
 
 package:
 	mvn -ntp -DskipTests package
@@ -21,8 +21,8 @@ run:
 run-kafka:
 	docker compose up -d kafka
 
-run-local: run-kafka
-	@echo "Kafka up on localhost:9092. In separate terminals:"
+run-local: run-kafka run-postgres
+	@echo "Kafka on localhost:9092, Postgres on localhost:5432. In separate terminals:"
 	@echo "  java -jar order-api/target/order-api.jar"
 	@echo "  java -jar fulfillment-service/target/fulfillment-service.jar"
 	@echo "  java -jar notification-service/target/notification-service.jar"
@@ -53,3 +53,10 @@ consume-orders:
 consume-events:
 	docker exec -it ops-kafka /opt/kafka/bin/kafka-console-consumer.sh \
 	  --bootstrap-server localhost:9092 --topic order-events --from-beginning
+
+consume-dlq:
+	docker exec -it ops-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+	  --bootstrap-server localhost:9092 --topic orders.dlq --from-beginning --property print.headers=true
+
+psql:
+	docker exec -it ops-postgres psql -U orders -d orders
