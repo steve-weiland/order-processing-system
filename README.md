@@ -6,16 +6,19 @@ into one with **effectively-once** delivery semantics.
 
 V1 was deliberately broken in five well-known ways. v2.0.0 fixed four of them
 (F1–F4) with three mechanisms: an **idempotency key table**, a **transactional
-outbox**, and a **dead letter queue**. v2.1.0 closes F5 (consumer lag) with
-**virtual-thread parallel batch processing** + **async outbox publish**. Each
-fix is locked in by a deterministic chaos test whose assertion was inverted
-across the V1 → V2 commit boundary — that diff is the portfolio artifact.
+outbox**, and a **dead letter queue**. v2.1.0 closed F5 (consumer lag) with
+**virtual-thread parallel batch processing** + **async outbox publish**. v2.2.0
+adds **multi-instance fulfillment** — two `fulfillment-service` JVMs share
+the broker + Postgres without duplicate publishes, coordinated by
+`SELECT FOR UPDATE SKIP LOCKED` on the outbox poll. Each fix is locked in by
+a deterministic chaos test (F1–F6) whose assertion was inverted across the
+V1 → V2.x commit boundary — that diff is the portfolio artifact.
 
 | | |
 |--|--|
 | **Spec** | [`spec.md`](./spec.md) — RFC-2119 requirements, V1/V2 mapping |
 | **Chaos report** | [`docs/chaos-report.md`](./docs/chaos-report.md) — V1 baseline → V2 fix per failure |
-| **Status** | `v2.1.0` released — all 5 V1 failure modes resolved. |
+| **Status** | `v2.2.0` released — multi-instance fulfillment via `SELECT FOR UPDATE SKIP LOCKED`. All 6 documented failure modes (F1-F6) green in the chaos suite. |
 
 ---
 
@@ -63,16 +66,18 @@ The V1 → V2 story, with the failing chaos test that drove each fix.
 | F3 | Auto-commit advanced the offset before work completed → record **lost** on restart. | DB tx is the durability gate; `commitSync` runs only after `COMMIT` succeeds. | `F3_LostOrdersTest` — flipped from `assertEquals(0, …)` to `assertEquals(1, …)`. |
 | F4 | Malformed JSON crashed the consumer thread; the partition stalled. | Read as `byte[]`, parse manually; on parse failure, publish raw bytes to `orders.dlq` with diagnostic headers, commit the source offset, continue. | `F4_PoisonMessageTest` — flipped to assert `!consumer.crashed()`, valid event = 1, DLQ size = 1, headers populated. |
 | F5 | Single-thread × 50 ms / record → lag grew linearly under burst. | **v2.1.0**: `poll()` batches dispatched onto a virtual-thread executor; per-batch `commitSync`; bounded by `--worker-pool-size` semaphore (default 32); outbox relay moved to async batch publish. | `F5_ConsumerLagTest` — flipped from `assertTrue(lag > 200)` to `assertTrue(lag < 50)`; measured lag = 0 in 2 s window. |
+| F6 | (new in v2.2.0 — didn't exist when fulfillment ran in a single JVM) Two relay instances poll the same `WHERE published_at IS NULL` rows → every event published twice. | **v2.2.0**: `SELECT FOR UPDATE SKIP LOCKED` inside an explicit DB tx; the lock is held across the Kafka publish and the `markPublishedBatch` UPDATE so a second instance cannot lock-and-publish the same row. | `F6_MultiInstanceOutboxRaceTest` — spawns two `V2Stack`s sharing broker + Postgres; asserts exactly N events for N orders. |
 
 Run the suite and watch the numbers come out:
 
 ```bash
 $ make chaos
-[INFO] Tests run: 1, in F1_DuplicateOrdersTest                Time: 4.9s   PASS
-[INFO] Tests run: 1, in F2_DuplicateNotificationsTest         Time: 9.4s   PASS
-[INFO] Tests run: 1, in F3_LostOrdersTest                     Time: 3.7s   PASS
-[INFO] Tests run: 1, in F4_PoisonMessageTest                  Time: 3.8s   PASS
-[INFO] Tests run: 1, in F5_ConsumerLagTest                    Time: 3.0s   PASS
+[INFO] Tests run: 1, in F1_DuplicateOrdersTest                Time: 4.8s   PASS
+[INFO] Tests run: 1, in F2_DuplicateNotificationsTest         Time: 9.1s   PASS
+[INFO] Tests run: 1, in F3_LostOrdersTest                     Time: 2.6s   PASS
+[INFO] Tests run: 1, in F4_PoisonMessageTest                  Time: 3.7s   PASS
+[INFO] Tests run: 1, in F5_ConsumerLagTest                    Time: 2.8s   PASS
+[INFO] Tests run: 1, in F6_MultiInstanceOutboxRaceTest        Time: 5.8s   PASS
 
 === chaos-test/target/lag-v2.1.txt ===
 burst=500 window=2s lag=0
@@ -128,6 +133,19 @@ collapsed it into a single `INSERT … ON CONFLICT DO NOTHING` that returns
 a row count: 1 = "we own this fulfillment, write the outbox row", 0 =
 "someone else won, skip". The check IS the insert.
 
+**Multi-instance via `SKIP LOCKED`, not leader election.** v2.2.0 lets the
+fulfillment-service scale horizontally. The naive question is "who owns
+the outbox?" — leader election with ZooKeeper or etcd is the textbook
+answer. We took the simpler path: `SELECT … FOR UPDATE SKIP LOCKED` inside
+an explicit DB transaction. Each unpublished row is locked by exactly one
+instance's transaction; concurrent pollers `SKIP LOCKED` rows another
+instance is holding and pick up disjoint work. Stateless, no coordination
+service, no split-brain. The Postgres documentation calls this the
+"competing consumers / work queue" pattern. The lock has to be held until
+the Kafka publish AND `markPublishedBatch` have committed — releasing it
+earlier reopens the duplicate-publish window the whole pattern exists to
+close.
+
 ---
 
 ## Run it
@@ -136,10 +154,26 @@ a row count: 1 = "we own this fulfillment, write the outbox row", 0 =
 
 ```bash
 make run                                       # docker compose up --build
+                                               # brings up: kafka, postgres, order-api,
+                                               # notification-service, AND TWO
+                                               # fulfillment-service instances
 curl -X POST http://localhost:6080/orders \
   -H 'Content-Type: application/json' \
   -d '{"customerId":"alice","items":[{"sku":"SKU-A","quantity":1,"unitPrice":9.99}]}'
 # → {"orderId":"<uuid>"}
+```
+
+Watch both instances pick up disjoint work:
+
+```bash
+docker logs ops-fulfillment-1 2>&1 | grep '"relay published count'
+docker logs ops-fulfillment-2 2>&1 | grep '"relay published count'
+# Each instance's tick count > 0; sum across both equals total outbox rows.
+# Verify no duplicates:
+docker exec ops-kafka /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server localhost:9092 --topic order-events \
+  | awk -F: '{sum+=$3} END {print sum}'
+# == number of orders POSTed
 ```
 
 Demonstrate idempotency-key replay:
@@ -245,7 +279,7 @@ order-processing-system/
 |---------|-------|-------|
 | `v2.0.0` ✅ | Correctness | F1–F4 fixed via idempotency + outbox + DLQ |
 | `v2.1.0` ✅ | Throughput | F5 fixed — virtual-thread parallel batch + async outbox publish; lag 469 → 0 |
-| `v2.2.0` | Multi-instance | `SELECT FOR UPDATE SKIP LOCKED` on outbox; horizontal scaling of fulfillment-service; partition count revisit |
+| `v2.2.0` ✅ | Multi-instance | F6 fixed — `SELECT FOR UPDATE SKIP LOCKED` lets two fulfillment-service JVMs share the same outbox without duplicate publishes |
 | `v2.3.0` | Hardening | Notification-side idempotency (closes the relay-crash duplicate window); retry-before-DLQ topic |
 | V3 | Architectural shift | Saga pattern (payment → inventory → ship); schema registry + Avro/Protobuf |
 

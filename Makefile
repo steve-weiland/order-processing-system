@@ -28,7 +28,7 @@ run-local: run-kafka run-postgres
 	@echo "  java -jar notification-service/target/notification-service.jar"
 
 logs:
-	docker compose logs -f order-api fulfillment-service notification-service
+	docker compose logs -f order-api fulfillment-service-1 fulfillment-service-2 notification-service
 
 stop:
 	docker compose down

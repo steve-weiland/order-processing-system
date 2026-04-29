@@ -2,9 +2,9 @@
 
 | Field   | Value              |
 |---------|--------------------|
-| Version | 0.3 (draft)        |
+| Version | 0.4 (draft)        |
 | Author  | Steve Weiland      |
-| Date    | 2026-04-28         |
+| Date    | 2026-04-29         |
 | Status  | Draft              |
 
 ---
@@ -180,10 +180,11 @@ client ──POST /orders──▶ order-api ──▶ [orders] ──▶ fulfil
 | ID | Requirement |
 |----|-------------|
 | OPS-70 | `docker-compose up` **MUST** start Kafka, Postgres, and all three services. |
-| OPS-71 | `fulfillment-service` **MUST** run database migrations (Flyway, see §3.10) on startup before the consumer subscribes. |
+| OPS-71 | `fulfillment-service` **MUST** run database migrations (Flyway, see §3.10) on startup before the consumer subscribes. Concurrent migrations across multiple instances are safe — Flyway holds a Postgres advisory lock on its history table. |
 | OPS-72 | Each service **MUST** handle `SIGTERM` with graceful shutdown: drain the outbox relay one final time, flush in-flight producer batches, `commitSync` the consumer's current offsets, close the consumer, exit within 10 s. |
 | OPS-73 | Services **MUST** emit structured JSON logs; `orderId` **MUST** be present in MDC for any log line scoped to a specific order. |
 | OPS-74 | A root `Makefile` **MUST** expose targets: `build`, `test`, `chaos`, `run` (everything in docker), `run-local` (Kafka + Postgres in docker, services on host). |
+| OPS-76 | `docker-compose.yml` **MUST** run **two** `fulfillment-service` instances (`ops-fulfillment-1`, `ops-fulfillment-2`) sharing the broker and Postgres, demonstrating the multi-instance outbox coordination introduced in v2.2.0. |
 
 ### 3.9 Idempotency
 
@@ -201,12 +202,13 @@ client ──POST /orders──▶ order-api ──▶ [orders] ──▶ fulfil
 |----|-------------|
 | OPS-110 | A Postgres table `outbox` **MUST** exist with columns: `id` (bigserial, primary key), `aggregate_id` (text — the `orderId`), `topic` (text), `record_key` (text), `payload` (bytea), `created_at` (timestamptz, default `now()`), `published_at` (timestamptz, nullable). |
 | OPS-111 | `fulfillment-service` **MUST** insert the `processed_orders` row and the `outbox` row in a single Postgres transaction. The Kafka publish **MUST NOT** be part of this transaction. |
-| OPS-112 | A separate **outbox relay** thread inside `fulfillment-service` **MUST** poll `outbox WHERE published_at IS NULL ORDER BY id LIMIT 100` at a configurable interval (default 100 ms) and republish unpublished rows to Kafka. *(See OPS-117 / OPS-118 for v2.1.0 batching semantics.)* |
+| OPS-112 | A separate **outbox relay** thread inside `fulfillment-service` **MUST** poll `outbox WHERE published_at IS NULL ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED` at a configurable interval (default 100 ms) inside an explicit DB transaction, and republish unpublished rows to Kafka. The `FOR UPDATE SKIP LOCKED` is the multi-instance coordination primitive (see §7 Q20). |
 | OPS-117 | The outbox relay **MUST** issue all `producer.send` calls in the polled batch *before* awaiting any individual ack, then await each `Future<RecordMetadata>` in turn. *(v2.1.0; replaces the v2.0.0 send-then-await-one-by-one loop.)* |
 | OPS-118 | After all `Future`s in the batch have completed, the relay **MUST** mark the entire batch published in a single `UPDATE outbox SET published_at = now() WHERE id = ANY(?)` statement. *(v2.1.0.)* |
+| OPS-119 | The relay's poll → publish → mark-published cycle **MUST** execute as a single Postgres transaction. The `FOR UPDATE` lock acquired by OPS-112 **MUST** be held through every `producer.send().get()` and the `markPublishedBatch` UPDATE; the transaction commits only after Kafka has acked every record in the batch. *(v2.2.0; releasing the lock before the publish reopens the duplicate-publish window.)* |
 | OPS-113 | The outbox relay **MUST** use an idempotent producer (`enable.idempotence=true`, `acks=all`). Publish failures **MUST** be retried in the next poll cycle; the row stays unpublished until ack. |
 | OPS-114 | Database schema migrations **MUST** be managed by Flyway with migration files under `fulfillment-service/src/main/resources/db/migration/`. |
-| OPS-115 | The outbox relay **MUST** run in the same JVM process as the fulfillment consumer. *(Multi-instance fulfillment with `SELECT FOR UPDATE SKIP LOCKED` on outbox is v2.2.0 work.)* |
+| OPS-115 | The outbox relay **MUST** run in the same JVM process as the fulfillment consumer. *(v2.2.0)* The relay **MAY** run concurrently across multiple JVM instances against the same Postgres; row-level locks acquired by `FOR UPDATE SKIP LOCKED` ensure that each unpublished row is published by exactly one instance. |
 | OPS-116 | The outbox relay's Kafka publish loop **MUST** be at-least-once semantics. Duplicate publishes are absorbed by `processed_orders` for upstream dedup; duplicate `order-events` records observed by `notification-service` are a known V2 limitation (see §3.6 OPS-53). |
 
 ### 3.11 Dead Letter Queue
@@ -338,15 +340,13 @@ Deferred to v2.1.0 / v2.2.0 / v2.3.0+ as marked. Anything that fundamentally
 re-architects the system (Kafka transactions in place of outbox, sagas across
 multiple aggregates, etc.) is V3 territory.
 
-- **Multi-instance fulfillment** *(v2.2.0)*. Multiple fulfillment-service
-  replicas need `SELECT FOR UPDATE SKIP LOCKED` on the outbox poll to avoid
-  duplicate publishes; partition count likely bumps from 3 → 6+.
 - **Notification-side idempotency** *(v2.3.0)*. A relay-crash-mid-publish
   window can produce one duplicate notification. A `processed_notifications`
   table in `notification-service` closes the window.
 - **Retry-before-DLQ** *(v2.3.0)*. A separate retry topic with bounded attempts
   before final DLQ routing.
 - **Prometheus metrics** *(v2.x or Build 5)*.
+- **Outbox-relay leader election.** An alternative to `SKIP LOCKED` where one instance "owns" outbox publishing. Rejected because `SKIP LOCKED` is stateless and scales horizontally without coordination. Documented here for completeness.
 - Saga pattern with compensating actions (payment → inventory → ship) — V3.
 - Distributed tracing (Build 5).
 - Schema registry, Avro/Protobuf (plain JSON only).
@@ -367,6 +367,11 @@ implement it.
 | F3 | Lost orders after premature commit | Auto-commit advanced past unprocessed record | `commitSync` only after DB transaction commits; durable state is the gate, not the timer | OPS-31, OPS-111 |
 | F4 | Poison message stalls partition | Deserialization exception killed consumer thread | Deserialize as `byte[]`, parse manually; route parse failures to `orders.dlq` and continue | OPS-32, OPS-121, OPS-122 |
 | F5 | Consumer lag under burst load | 50 ms work × single thread → linear lag growth | Virtual-thread parallel batch processing in fulfillment-service; bounded concurrency via semaphore; per-batch `commitSync`; async outbox publish | OPS-36, OPS-37, OPS-38, OPS-117, OPS-118 |
+| F6 | Multi-instance outbox-poll race | Two relay instances poll the same `WHERE published_at IS NULL` rows | `SELECT FOR UPDATE SKIP LOCKED` inside an explicit DB transaction; lock held across the entire publish + mark-published cycle | OPS-112, OPS-119 |
+
+F6 is **new in v2.2.0** — it didn't exist in V1 (no outbox), or in v2.0.0 / v2.1.0
+(single-instance). It surfaces only when fulfillment-service runs in multiple
+JVMs against the same Postgres + Kafka.
 
 The chaos test suite at `chaos-test/` retains its V1-baseline assertions for
 all five tests. V2 implementation work flips F1–F4 assertions to require the
@@ -379,6 +384,7 @@ fix; F5 assertion stays as-is and is the v2.1.0 entry point.
 | F3 | `F3_LostOrdersTest` | `assertEquals(0, events.size())` | `assertEquals(1, events.size())` |
 | F4 | `F4_PoisonMessageTest` | `assertTrue(consumer.crashed())`, `assertEquals(0, validEvents)` | `assertFalse(consumer.crashed())`, `assertEquals(1, validEvents)`, `assertEquals(1, dlqRecords)` |
 | F5 | `F5_ConsumerLagTest` | `assertTrue(lag > 200)` | flipped in v2.1.0: `assertTrue(lag < 50)` |
+| F6 | `F6_MultiInstanceOutboxRaceTest` | (new in v2.2.0) | `assertEquals(N, events.size())` with two concurrent relay instances |
 
 ---
 
@@ -407,6 +413,10 @@ V1 entries Q1–Q7 are unchanged; V2 adds Q8–Q14.
 | Q17 | Bounded or unbounded concurrency? | **Bounded** via semaphore at `--worker-pool-size` (default 32). Virtual threads are cheap, but DB connections aren't (Hikari pool size 16). The semaphore protects against pathological bursts; the connection pool provides the secondary bound. |
 | Q18 | Commit cadence? | **Per-batch.** One `commitSync` per `poll()` instead of N. Reduces commit overhead and matches the all-or-nothing batch-failure semantics (OPS-37). |
 | Q19 | Outbox relay: per-row send or async batch? | **Async batch.** Issue all `producer.send` calls before awaiting any future, then batch the `markPublished` UPDATE. Order-of-magnitude faster than v2.0.0's serial loop on the same workload. |
+| Q20 | How to coordinate multi-instance outbox publishing? | **`SELECT FOR UPDATE SKIP LOCKED`.** Stateless, no leader election, scales linearly. The textbook Postgres work-queue pattern: each row is locked by exactly one instance's transaction; concurrent pollers `SKIP LOCKED` rows and pick up disjoint work. |
+| Q21 | Lock duration includes the Kafka publish? | **Yes.** Releasing the lock before the publish reopens the duplicate-publish window — Instance B could lock-and-publish the same row before Instance A's `markPublished` lands. The Kafka round-trip (~5-50 ms per batch) inside the tx is acceptable; the lock holds for the whole batch, not per-record. |
+| Q22 | Bump partition count to enable scaling beyond 3 instances? | **No.** 3 partitions is enough to demonstrate the pattern. Higher counts are a deployment / capacity concern, not a correctness one. |
+| Q23 | How many fulfillment instances in `docker-compose.yml`? | **Two.** Enough to demonstrate the pattern and to drive the `F6_MultiInstanceOutboxRaceTest` assertion. |
 
 ---
 
@@ -425,3 +435,4 @@ V1 entries Q1–Q7 are unchanged; V2 adds Q8–Q14.
 | 0.1 | 2026-04-24 | Steve Weiland | Initial V1 draft — three services, auto-commit, no idempotency, no DLQ |
 | 0.2 | 2026-04-28 | Steve Weiland | v2.0.0: Postgres + idempotency table (F1, F2 fix), transactional outbox + manual commit (F2, F3 fix), DLQ for poison messages (F4 fix). F5 deferred to v2.1.0. |
 | 0.3 | 2026-04-28 | Steve Weiland | v2.1.0: virtual-thread parallel batch processing in fulfillment-service (F5 fix); per-batch `commitSync`; bounded concurrency via `--worker-pool-size` semaphore; async outbox relay publish + batched `markPublished`. New OPS-36, OPS-37, OPS-38, OPS-117, OPS-118; resolved Q15-Q19. |
+| 0.4 | 2026-04-29 | Steve Weiland | v2.2.0: multi-instance fulfillment via `SELECT FOR UPDATE SKIP LOCKED` on outbox poll, with the lock held across publish + mark-published in a single DB transaction. New F6 failure mode and chaos test; OPS-112 updated, OPS-115 relaxed to allow concurrent relays, OPS-119 added, OPS-76 added (two-instance docker-compose). Resolved Q20-Q23. |

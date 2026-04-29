@@ -402,15 +402,91 @@ $ make psql
 
 ---
 
+## F6 — Multi-instance outbox-poll race
+
+### When it manifests
+
+F6 is **new in v2.2.0**. It didn't exist in V1 (no outbox at all), or in
+v2.0.0 / v2.1.0 (single fulfillment-service JVM). The first time the
+project runs two `fulfillment-service` instances against the same
+Postgres, both relay threads poll the same
+`SELECT id, … FROM outbox WHERE published_at IS NULL` and both pick up
+identical rows. They each publish to Kafka; the `notification-service`
+sees every event twice. Customers get two notifications per order.
+
+### v2.2.0 fix
+
+[`OutboxStore.findUnpublished`](../fulfillment-service/src/main/java/com/steveweiland/orders/fulfillment/OutboxStore.java)
+adds `FOR UPDATE SKIP LOCKED`. [`OutboxRelay.pollAndPublish`](../fulfillment-service/src/main/java/com/steveweiland/orders/fulfillment/OutboxRelay.java)
+wraps the entire poll → publish → mark cycle in a single Postgres
+transaction so the row-level locks are held across the Kafka publish.
+
+```diff
+- public List<Pending> findUnpublished(int limit) { /* opens own connection */ }
++ public List<Pending> findUnpublished(Connection c, int limit) {
++     "SELECT … FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT ? " +
++     "FOR UPDATE SKIP LOCKED"
++ }
+```
+
+```diff
+- // v2.1.0: send + mark, no shared transaction
+- List<Pending> pending = store.findUnpublished(BATCH);
+- producer.send(...).get(); store.markPublishedBatch(ids);
++ // v2.2.0: single tx; lock held across publish
++ try (Connection c = ds.getConnection()) {
++     c.setAutoCommit(false);
++     List<Pending> pending = store.findUnpublished(c, BATCH);
++     for (p : pending) futures.add(producer.send(...));
++     for (f : futures) f.get();
++     store.markPublishedBatch(c, ids);
++     c.commit();
++ }
+```
+
+### Evidence — chaos test
+
+`F6_MultiInstanceOutboxRaceTest` spawns two `V2Stack`s sharing the same
+broker + Postgres, sends 50 orders, asserts exactly 50 events on
+`order-events`. The pre-fix expected behavior is 100 (every event
+duplicated). Test runs in ~5.8 s.
+
+```
+[INFO] Tests run: 1 in F6_MultiInstanceOutboxRaceTest    Time: 5.8 s    PASS
+```
+
+### Evidence — manual run
+
+A `docker compose up` with the v2.2.0 two-instance topology, then 100
+orders POSTed in a tight loop:
+
+```
+$ docker logs ops-fulfillment-1 2>&1 | grep '"relay published count' | wc -l
+4    # 4 ticks: count=15, 13, 2, ...
+$ docker logs ops-fulfillment-2 2>&1 | grep '"relay published count' | wc -l
+7    # 7 ticks: count=13, 11, 13, ...
+
+$ docker exec ops-kafka /opt/kafka/bin/kafka-get-offsets.sh \
+    --bootstrap-server localhost:9092 --topic order-events \
+    | awk -F: '{sum+=$3} END {print sum}'
+100   # exactly 100 events for 100 orders — no duplicates
+```
+
+Both relays did real work (publishing disjoint rows); the total event
+count matches the order count exactly.
+
+---
+
 ## Summary table
 
-| # | V1 result | V2 result | Mechanism | Test |
-|---|-----------|-----------|-----------|------|
+| # | V1 result | Latest V2.x result | Mechanism | Test |
+|---|-----------|-------------------|-----------|------|
 | F1 | 2 events | 1 event | `processed_orders` + `Idempotency-Key` | `F1_DuplicateOrdersTest` |
 | F2 | 2 events | 1 event | `commitSync` after DB tx + idempotency | `F2_DuplicateNotificationsTest` |
 | F3 | 0 events (lost) | 1 event | DB tx is the durability gate | `F3_LostOrdersTest` |
-| F4 | consumer crashed, partition stalled | consumer survived, DLQ has 1, valid event = 1 | `byte[]` deserialize + DLQ routing | `F4_PoisonMessageTest` |
+| F4 | consumer crashed, partition stalled | consumer survived, DLQ has 1, valid event = 1 | `byte[]` deserialize + DLQ routing (v2.0.0) | `F4_PoisonMessageTest` |
 | F5 | lag 500 / 2s | lag 0 / 2s | virtual-thread parallel batch + async outbox publish (v2.1.0) | `F5_ConsumerLagTest` |
+| F6 | (didn't exist single-instance) | exactly N events for N orders with 2 relays | `SELECT FOR UPDATE SKIP LOCKED` (v2.2.0) | `F6_MultiInstanceOutboxRaceTest` |
 
 V2 chaos suite total runtime: **~25 s** (Testcontainers spin-up + 5 tests).
 
@@ -418,9 +494,6 @@ V2 chaos suite total runtime: **~25 s** (Testcontainers spin-up + 5 tests).
 
 ## Known v2.x limitations (deferred)
 
-- **Single-instance fulfillment** *(v2.2.0)*. Multiple replicas would race on
-  `outbox` polling. Closed with `SELECT FOR UPDATE SKIP LOCKED` on the
-  outbox query.
 - **Relay-crash duplicate-publish window** *(v2.3.0)*. The outbox relay is
   at-least-once; if the JVM crashes between `producer.send().get()` and
   `UPDATE outbox SET published_at = now()`, the next loop republishes — and
