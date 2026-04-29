@@ -477,6 +477,87 @@ count matches the order count exactly.
 
 ---
 
+## F7 — Relay-crash duplicate-publish window
+
+### When it manifests
+
+The outbox relay holds a DB transaction across the Kafka publish so it
+can commit `markPublishedBatch` atomically with the lock release. If the
+JVM crashes **after** Kafka has acked the record but **before** the
+relay's `commit()` lands, the DB tx rolls back — `published_at` stays
+NULL — so the next relay tick (this instance on restart, or another
+instance) picks up the row and republishes. Kafka's idempotent producer
+dedupes only within a single producer session; across a crash, the new
+session emits the record again. `order-events` ends up with two records
+for the same orderId.
+
+In v2.0.0–v2.2.0, `notification-service` had no idempotency, so each
+duplicate event triggered a duplicate notification. F7 was a documented
+known limitation across that whole window.
+
+### v2.3.0 fix
+
+A `processed_notifications` table:
+
+```sql
+CREATE TABLE processed_notifications (
+    order_id    UUID         PRIMARY KEY,
+    notified_at TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+```
+
+[`NotificationConsumer.notifyOne`](../notification-service/src/main/java/com/steveweiland/orders/notification/NotificationConsumer.java)
+now claims the orderId before logging:
+
+```java
+if (!store.claim(event.orderId())) {
+    log.info("duplicate notification suppressed partition={} offset={}", partition, offset);
+    return;
+}
+log.info("Notification sent for order={} customer={} ...");
+hook.accept(event);
+```
+
+`ProcessedNotificationsStore.claim` is the same atomic
+`INSERT … ON CONFLICT DO NOTHING` pattern that `processed_orders` uses;
+row count = 1 means we won the race, 0 means a previous delivery already
+notified this customer.
+
+### Evidence — chaos test
+
+`F7_NotificationDedupTest` publishes two identical `OrderFulfilled`
+records directly to `order-events`, then asserts the in-memory hook fires
+exactly once. ~3 s.
+
+```
+[INFO] Tests run: 1 in F7_NotificationDedupTest    Time: 3.2 s    PASS
+```
+
+### Evidence — manual run
+
+`docker compose up`; POST 5 orders; manually inject a duplicate
+`OrderFulfilled` for one of them via `kafka-console-producer`:
+
+```
+$ docker exec -i ops-kafka /opt/kafka/bin/kafka-console-producer.sh \
+    --bootstrap-server localhost:9092 --topic order-events <<< \
+    '{"orderId":"00778798-…","customerId":"replay","fulfilledAt":"2026-04-29T12:00:00Z"}'
+
+$ docker logs ops-notifications | grep -E '(Notification sent|duplicate notification)'
+…  Notification sent for order=00778798-… customer=v23-1 partition=2 offset=0
+…  Notification sent for order=5b46cfd3-… customer=v23-3 partition=1 offset=0
+…  Notification sent for order=b49a0cc4-… customer=v23-2 partition=0 offset=0
+…  Notification sent for order=eaf81015-… customer=v23-5 partition=0 offset=1
+…  Notification sent for order=e5dcd42b-… customer=v23-4 partition=0 offset=2
+…  duplicate notification suppressed partition=1 offset=1   ← injected duplicate
+
+$ docker exec ops-postgres psql -U orders -d orders -t -c \
+    'SELECT count(*) FROM processed_notifications;'
+   5    ← still 5; duplicate absorbed
+```
+
+---
+
 ## Summary table
 
 | # | V1 result | Latest V2.x result | Mechanism | Test |
@@ -487,6 +568,7 @@ count matches the order count exactly.
 | F4 | consumer crashed, partition stalled | consumer survived, DLQ has 1, valid event = 1 | `byte[]` deserialize + DLQ routing (v2.0.0) | `F4_PoisonMessageTest` |
 | F5 | lag 500 / 2s | lag 0 / 2s | virtual-thread parallel batch + async outbox publish (v2.1.0) | `F5_ConsumerLagTest` |
 | F6 | (didn't exist single-instance) | exactly N events for N orders with 2 relays | `SELECT FOR UPDATE SKIP LOCKED` (v2.2.0) | `F6_MultiInstanceOutboxRaceTest` |
+| F7 | (documented v2.0.0–v2.2.0 limitation) | 1 notification per orderId | `processed_notifications` (v2.3.0) | `F7_NotificationDedupTest` |
 
 V2 chaos suite total runtime: **~25 s** (Testcontainers spin-up + 5 tests).
 
@@ -494,11 +576,9 @@ V2 chaos suite total runtime: **~25 s** (Testcontainers spin-up + 5 tests).
 
 ## Known v2.x limitations (deferred)
 
-- **Relay-crash duplicate-publish window** *(v2.3.0)*. The outbox relay is
-  at-least-once; if the JVM crashes between `producer.send().get()` and
-  `UPDATE outbox SET published_at = now()`, the next loop republishes — and
-  notification-service has no idempotency. One duplicate notification per
-  relay crash. Closes with notification-side dedup.
-- **No retry-before-DLQ** *(v2.3.0)*. First parse failure routes straight
-  to DLQ. Fine for malformed JSON; less fine for transient downstream
-  failures.
+- **No retry-before-DLQ** *(v2.4.0+ if needed)*. First parse failure
+  routes straight to DLQ. Fine for malformed JSON (deterministic — retries
+  won't help). Originally targeted for v2.3.0 but deferred: there's no
+  concrete transient-error path in the current pipeline that retry-topics
+  would mitigate. Will revisit when an external HTTP call or similar
+  flaky dependency lands.

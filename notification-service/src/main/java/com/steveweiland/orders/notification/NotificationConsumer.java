@@ -14,6 +14,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
+import javax.sql.DataSource;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -26,18 +27,21 @@ public final class NotificationConsumer implements Runnable, AutoCloseable {
     public static final String DEFAULT_GROUP_ID = "notifications";
 
     private final KafkaConsumer<String, OrderFulfilled> consumer;
+    private final ProcessedNotificationsStore store;
     private final String topic;
     private volatile boolean running = true;
     private volatile Consumer<OrderFulfilled> hook = e -> {};
 
-    public NotificationConsumer(String bootstrapServers) {
-        this(bootstrapServers, DEFAULT_TOPIC, DEFAULT_GROUP_ID, Map.of());
+    public NotificationConsumer(String bootstrapServers, DataSource ds) {
+        this(bootstrapServers, DEFAULT_TOPIC, DEFAULT_GROUP_ID, Map.of(),
+                new ProcessedNotificationsStore(ds));
     }
 
     public NotificationConsumer(String bootstrapServers,
                                 String topic,
                                 String groupId,
-                                Map<String, Object> overrides) {
+                                Map<String, Object> overrides,
+                                ProcessedNotificationsStore store) {
         Properties props = new Properties();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
@@ -49,6 +53,7 @@ public final class NotificationConsumer implements Runnable, AutoCloseable {
         this.consumer = new KafkaConsumer<>(props, new StringDeserializer(),
                 new JsonDeserializer<>(OrderFulfilled.class));
         this.topic = topic;
+        this.store = store;
     }
 
     public void setHook(Consumer<OrderFulfilled> hook) {
@@ -80,6 +85,12 @@ public final class NotificationConsumer implements Runnable, AutoCloseable {
     private void notifyOne(OrderFulfilled event, int partition, long offset) {
         MDC.put("orderId", event.orderId());
         try {
+            // Atomic claim — closes the relay-crash duplicate-publish window.
+            // True = newly notified; False = duplicate (skip silently).
+            if (!store.claim(event.orderId())) {
+                log.info("duplicate notification suppressed partition={} offset={}", partition, offset);
+                return;
+            }
             log.info("Notification sent for order={} customer={} partition={} offset={}",
                     event.orderId(), event.customerId(), partition, offset);
             hook.accept(event);

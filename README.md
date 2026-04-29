@@ -18,7 +18,7 @@ V1 → V2.x commit boundary — that diff is the portfolio artifact.
 |--|--|
 | **Spec** | [`spec.md`](./spec.md) — RFC-2119 requirements, V1/V2 mapping |
 | **Chaos report** | [`docs/chaos-report.md`](./docs/chaos-report.md) — V1 baseline → V2 fix per failure |
-| **Status** | `v2.2.0` released — multi-instance fulfillment via `SELECT FOR UPDATE SKIP LOCKED`. All 6 documented failure modes (F1-F6) green in the chaos suite. |
+| **Status** | `v2.3.0` released — notification-side idempotency closes the relay-crash duplicate-publish window. All 7 documented failure modes (F1-F7) green in the chaos suite. |
 
 ---
 
@@ -67,17 +67,19 @@ The V1 → V2 story, with the failing chaos test that drove each fix.
 | F4 | Malformed JSON crashed the consumer thread; the partition stalled. | Read as `byte[]`, parse manually; on parse failure, publish raw bytes to `orders.dlq` with diagnostic headers, commit the source offset, continue. | `F4_PoisonMessageTest` — flipped to assert `!consumer.crashed()`, valid event = 1, DLQ size = 1, headers populated. |
 | F5 | Single-thread × 50 ms / record → lag grew linearly under burst. | **v2.1.0**: `poll()` batches dispatched onto a virtual-thread executor; per-batch `commitSync`; bounded by `--worker-pool-size` semaphore (default 32); outbox relay moved to async batch publish. | `F5_ConsumerLagTest` — flipped from `assertTrue(lag > 200)` to `assertTrue(lag < 50)`; measured lag = 0 in 2 s window. |
 | F6 | (new in v2.2.0 — didn't exist when fulfillment ran in a single JVM) Two relay instances poll the same `WHERE published_at IS NULL` rows → every event published twice. | **v2.2.0**: `SELECT FOR UPDATE SKIP LOCKED` inside an explicit DB tx; the lock is held across the Kafka publish and the `markPublishedBatch` UPDATE so a second instance cannot lock-and-publish the same row. | `F6_MultiInstanceOutboxRaceTest` — spawns two `V2Stack`s sharing broker + Postgres; asserts exactly N events for N orders. |
+| F7 | Outbox-relay JVM crashes between successful Kafka publish and `markPublishedBatch` → on restart the row is republished. The idempotent producer dedupes within a session, not across crashes. Pre-v2.3.0 `notification-service` had no idempotency, so customers got two notifications. | **v2.3.0**: `processed_notifications` table; atomic `INSERT ... ON CONFLICT DO NOTHING` before the log emit. Duplicate deliveries lose the conflict and are silently suppressed (`duplicate notification suppressed` log line). | `F7_NotificationDedupTest` — publishes two identical `OrderFulfilled` records to `order-events`; asserts exactly one notification fires. |
 
 Run the suite and watch the numbers come out:
 
 ```bash
 $ make chaos
-[INFO] Tests run: 1, in F1_DuplicateOrdersTest                Time: 4.8s   PASS
-[INFO] Tests run: 1, in F2_DuplicateNotificationsTest         Time: 9.1s   PASS
+[INFO] Tests run: 1, in F1_DuplicateOrdersTest                Time: 4.7s   PASS
+[INFO] Tests run: 1, in F2_DuplicateNotificationsTest         Time: 9.0s   PASS
 [INFO] Tests run: 1, in F3_LostOrdersTest                     Time: 2.6s   PASS
-[INFO] Tests run: 1, in F4_PoisonMessageTest                  Time: 3.7s   PASS
-[INFO] Tests run: 1, in F5_ConsumerLagTest                    Time: 2.8s   PASS
+[INFO] Tests run: 1, in F4_PoisonMessageTest                  Time: 3.8s   PASS
+[INFO] Tests run: 1, in F5_ConsumerLagTest                    Time: 3.1s   PASS
 [INFO] Tests run: 1, in F6_MultiInstanceOutboxRaceTest        Time: 5.8s   PASS
+[INFO] Tests run: 1, in F7_NotificationDedupTest              Time: 3.2s   PASS
 
 === chaos-test/target/lag-v2.1.txt ===
 burst=500 window=2s lag=0
@@ -145,6 +147,19 @@ service, no split-brain. The Postgres documentation calls this the
 the Kafka publish AND `markPublishedBatch` have committed — releasing it
 earlier reopens the duplicate-publish window the whole pattern exists to
 close.
+
+**Idempotency at every consumer, not just at the producer.** v2.3.0 closes
+the last open V2.x correctness gap: the **relay-crash duplicate-publish
+window**. The Kafka idempotent producer dedupes retries within a single
+session; it cannot dedupe across a JVM crash that happens after a
+successful publish but before the matching `markPublishedBatch` UPDATE
+commits. The textbook fix is end-to-end exactly-once via Kafka
+transactions, but that requires DB↔Kafka coordination we explicitly
+rejected in Q9. The pragmatic fix is **idempotent consumers** —
+`notification-service` claims each `orderId` in `processed_notifications`
+with the same atomic INSERT-ON-CONFLICT pattern that `fulfillment-service`
+uses for `processed_orders`. The duplicate, when it arrives, loses the
+conflict and is silently suppressed.
 
 ---
 
@@ -280,7 +295,8 @@ order-processing-system/
 | `v2.0.0` ✅ | Correctness | F1–F4 fixed via idempotency + outbox + DLQ |
 | `v2.1.0` ✅ | Throughput | F5 fixed — virtual-thread parallel batch + async outbox publish; lag 469 → 0 |
 | `v2.2.0` ✅ | Multi-instance | F6 fixed — `SELECT FOR UPDATE SKIP LOCKED` lets two fulfillment-service JVMs share the same outbox without duplicate publishes |
-| `v2.3.0` | Hardening | Notification-side idempotency (closes the relay-crash duplicate window); retry-before-DLQ topic |
+| `v2.3.0` ✅ | Hardening | F7 fixed — `processed_notifications` table closes the relay-crash duplicate-publish window |
+| `v2.4.0` | Hardening | Retry-before-DLQ — deferred from v2.3.0 (currently no concrete failure mode it would mitigate; revisit when transient downstream calls land) |
 | V3 | Architectural shift | Saga pattern (payment → inventory → ship); schema registry + Avro/Protobuf |
 
 ---

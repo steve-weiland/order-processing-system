@@ -2,7 +2,7 @@
 
 | Field   | Value              |
 |---------|--------------------|
-| Version | 0.4 (draft)        |
+| Version | 0.5 (draft)        |
 | Author  | Steve Weiland      |
 | Date    | 2026-04-29         |
 | Status  | Draft              |
@@ -163,9 +163,9 @@ client ──POST /orders──▶ order-api ──▶ [orders] ──▶ fulfil
 | ID | Requirement |
 |----|-------------|
 | OPS-50 | `notification-service` **MUST** subscribe to `order-events` with `group.id=notifications`. |
-| OPS-51 | `notification-service` **MUST** use `enable.auto.commit=false` and **MUST** call `commitSync` after each successful notification log emit. *(Replaces V1 OPS-51 auto-commit.)* |
-| OPS-52 | On receipt of `OrderFulfilled`, `notification-service` **MUST** log `Notification sent for order=<id> customer=<id>` at `INFO`. No external calls. |
-| OPS-53 | `notification-service` **MUST NOT** maintain its own idempotency table. Upstream idempotency in `fulfillment-service` (§3.9) is the source of truth; notification-side dedup is v2.3.0 hardening. *(Known v2.0.0 limitation: a relay-crash-mid-publish window can cause one duplicate notification per crash. See §5 and §7 Q14.)* |
+| OPS-51 | `notification-service` **MUST** use `enable.auto.commit=false` and **MUST** call `commitSync` after each successful notification (logged or skipped as duplicate). *(Replaces V1 OPS-51 auto-commit.)* |
+| OPS-52 | On receipt of `OrderFulfilled`, `notification-service` **MUST** atomically claim the `orderId` in `processed_notifications` (see §3.12). On successful claim, **MUST** log `Notification sent for order=<id> customer=<id>` at `INFO`. On conflict (`orderId` already present), **MUST** skip logging and commit the offset. |
+| OPS-53 | `notification-service` **MUST** maintain its own idempotency table (`processed_notifications`) — the source of truth for "this customer has been notified". *(v2.3.0; closes the relay-crash duplicate-publish window left open by v2.2.0.)* |
 
 ### 3.7 Kafka Broker Configuration
 
@@ -210,6 +210,15 @@ client ──POST /orders──▶ order-api ──▶ [orders] ──▶ fulfil
 | OPS-114 | Database schema migrations **MUST** be managed by Flyway with migration files under `fulfillment-service/src/main/resources/db/migration/`. |
 | OPS-115 | The outbox relay **MUST** run in the same JVM process as the fulfillment consumer. *(v2.2.0)* The relay **MAY** run concurrently across multiple JVM instances against the same Postgres; row-level locks acquired by `FOR UPDATE SKIP LOCKED` ensure that each unpublished row is published by exactly one instance. |
 | OPS-116 | The outbox relay's Kafka publish loop **MUST** be at-least-once semantics. Duplicate publishes are absorbed by `processed_orders` for upstream dedup; duplicate `order-events` records observed by `notification-service` are a known V2 limitation (see §3.6 OPS-53). |
+
+### 3.12 Notification-Side Idempotency
+
+| ID | Requirement |
+|----|-------------|
+| OPS-130 | A Postgres table `processed_notifications` **MUST** exist with columns: `order_id` (UUID, primary key), `notified_at` (timestamptz, default `now()`). |
+| OPS-131 | Before logging a notification, `notification-service` **MUST** issue `INSERT INTO processed_notifications (order_id) VALUES (?::uuid) ON CONFLICT DO NOTHING`. The row count from this statement (`1` = newly notified, `0` = duplicate) is the dedup decision. |
+| OPS-132 | `notification-service` **MUST** connect to the same Postgres database as `order-api` and `fulfillment-service`. Schema migrations are managed by Flyway from the `common` module's classpath, identical to the other services. |
+| OPS-133 | The relay-crash duplicate window (a producer-session-bounded duplicate that the idempotent producer cannot dedupe across crashes) **MUST** be absorbed by `processed_notifications`. The atomic INSERT is the gate; concurrent or replayed deliveries lose to the first claimant. |
 
 ### 3.11 Dead Letter Queue
 
@@ -340,11 +349,13 @@ Deferred to v2.1.0 / v2.2.0 / v2.3.0+ as marked. Anything that fundamentally
 re-architects the system (Kafka transactions in place of outbox, sagas across
 multiple aggregates, etc.) is V3 territory.
 
-- **Notification-side idempotency** *(v2.3.0)*. A relay-crash-mid-publish
-  window can produce one duplicate notification. A `processed_notifications`
-  table in `notification-service` closes the window.
-- **Retry-before-DLQ** *(v2.3.0)*. A separate retry topic with bounded attempts
-  before final DLQ routing.
+- **Retry-before-DLQ** *(v2.4.0 if needed)*. A separate retry topic with bounded
+  attempts before final DLQ routing. The original v2.3.0 plan included this,
+  but parse failures (the only error path that currently routes to DLQ) are
+  structural and deterministic — retrying the same bytes yields the same
+  failure. Transient DB errors are already covered by Kafka redelivery + the
+  `processed_orders` idempotency check. Deferred until a concrete failure
+  mode (e.g., transient downstream HTTP call) makes the case for it.
 - **Prometheus metrics** *(v2.x or Build 5)*.
 - **Outbox-relay leader election.** An alternative to `SKIP LOCKED` where one instance "owns" outbox publishing. Rejected because `SKIP LOCKED` is stateless and scales horizontally without coordination. Documented here for completeness.
 - Saga pattern with compensating actions (payment → inventory → ship) — V3.
@@ -368,6 +379,10 @@ implement it.
 | F4 | Poison message stalls partition | Deserialization exception killed consumer thread | Deserialize as `byte[]`, parse manually; route parse failures to `orders.dlq` and continue | OPS-32, OPS-121, OPS-122 |
 | F5 | Consumer lag under burst load | 50 ms work × single thread → linear lag growth | Virtual-thread parallel batch processing in fulfillment-service; bounded concurrency via semaphore; per-batch `commitSync`; async outbox publish | OPS-36, OPS-37, OPS-38, OPS-117, OPS-118 |
 | F6 | Multi-instance outbox-poll race | Two relay instances poll the same `WHERE published_at IS NULL` rows | `SELECT FOR UPDATE SKIP LOCKED` inside an explicit DB transaction; lock held across the entire publish + mark-published cycle | OPS-112, OPS-119 |
+| F7 | Relay-crash duplicate-publish window | Outbox relay JVM crashes between successful Kafka publish and the `markPublishedBatch` UPDATE; on restart the row is republished and `notification-service` (with no idempotency in v2.0.0–v2.2.0) logs the customer twice | `processed_notifications` table; atomic `INSERT … ON CONFLICT DO NOTHING` gate before logging | OPS-52, OPS-130, OPS-131, OPS-133 |
+
+F6 was new in v2.2.0 — it surfaces only with multiple fulfillment-service
+instances. F7 was a known v2.0.0–v2.2.0 limitation and is closed in v2.3.0.
 
 F6 is **new in v2.2.0** — it didn't exist in V1 (no outbox), or in v2.0.0 / v2.1.0
 (single-instance). It surfaces only when fulfillment-service runs in multiple
@@ -385,6 +400,7 @@ fix; F5 assertion stays as-is and is the v2.1.0 entry point.
 | F4 | `F4_PoisonMessageTest` | `assertTrue(consumer.crashed())`, `assertEquals(0, validEvents)` | `assertFalse(consumer.crashed())`, `assertEquals(1, validEvents)`, `assertEquals(1, dlqRecords)` |
 | F5 | `F5_ConsumerLagTest` | `assertTrue(lag > 200)` | flipped in v2.1.0: `assertTrue(lag < 50)` |
 | F6 | `F6_MultiInstanceOutboxRaceTest` | (new in v2.2.0) | `assertEquals(N, events.size())` with two concurrent relay instances |
+| F7 | `F7_NotificationDedupTest` | (new in v2.3.0) | publish a duplicate `OrderFulfilled` directly to `order-events`; assert exactly one notification logged |
 
 ---
 
@@ -417,6 +433,9 @@ V1 entries Q1–Q7 are unchanged; V2 adds Q8–Q14.
 | Q21 | Lock duration includes the Kafka publish? | **Yes.** Releasing the lock before the publish reopens the duplicate-publish window — Instance B could lock-and-publish the same row before Instance A's `markPublished` lands. The Kafka round-trip (~5-50 ms per batch) inside the tx is acceptable; the lock holds for the whole batch, not per-record. |
 | Q22 | Bump partition count to enable scaling beyond 3 instances? | **No.** 3 partitions is enough to demonstrate the pattern. Higher counts are a deployment / capacity concern, not a correctness one. |
 | Q23 | How many fulfillment instances in `docker-compose.yml`? | **Two.** Enough to demonstrate the pattern and to drive the `F6_MultiInstanceOutboxRaceTest` assertion. |
+| Q24 | Notification dedup: DB-backed `processed_notifications`, Kafka-header dedup key, or in-memory cache? | **DB-backed.** Matches the `processed_orders` pattern that fulfillment-service already uses. In-memory caches are lost on restart (the consumer would reprocess from `auto.offset.reset=earliest` on a clean group). Kafka-header dedup requires a stateful processor (Kafka Streams or KTable) that's heavier than what V2 needs. |
+| Q25 | Should `notification-service` share the same Postgres database as the other services? | **Yes.** Single shared DB is intentional in this system — it avoids cross-database transaction concerns (we don't have any) and keeps Flyway migration ownership simple. A microservices-style "every service owns its database" topology is V3 architectural work. |
+| Q26 | Retry-before-DLQ scope for v2.3.0? | **Deferred to v2.4.0+.** Parse failures (the only DLQ trigger today) are deterministic; retrying the same bytes won't change the outcome. Transient errors are already absorbed by Kafka redelivery + idempotency. Will revisit when there's a concrete transient-error path (e.g., an external HTTP call from a future processing step). |
 
 ---
 
@@ -436,3 +455,4 @@ V1 entries Q1–Q7 are unchanged; V2 adds Q8–Q14.
 | 0.2 | 2026-04-28 | Steve Weiland | v2.0.0: Postgres + idempotency table (F1, F2 fix), transactional outbox + manual commit (F2, F3 fix), DLQ for poison messages (F4 fix). F5 deferred to v2.1.0. |
 | 0.3 | 2026-04-28 | Steve Weiland | v2.1.0: virtual-thread parallel batch processing in fulfillment-service (F5 fix); per-batch `commitSync`; bounded concurrency via `--worker-pool-size` semaphore; async outbox relay publish + batched `markPublished`. New OPS-36, OPS-37, OPS-38, OPS-117, OPS-118; resolved Q15-Q19. |
 | 0.4 | 2026-04-29 | Steve Weiland | v2.2.0: multi-instance fulfillment via `SELECT FOR UPDATE SKIP LOCKED` on outbox poll, with the lock held across publish + mark-published in a single DB transaction. New F6 failure mode and chaos test; OPS-112 updated, OPS-115 relaxed to allow concurrent relays, OPS-119 added, OPS-76 added (two-instance docker-compose). Resolved Q20-Q23. |
+| 0.5 | 2026-04-29 | Steve Weiland | v2.3.0: notification-side idempotency closes the relay-crash duplicate-publish window. New `processed_notifications` table; OPS-52, OPS-53 flipped from "MUST NOT" to "MUST"; new §3.12 with OPS-130–OPS-133. F7 added to §6 / chaos suite. Retry-before-DLQ deferred to v2.4.0+ (Q26). Resolved Q24-Q26. |

@@ -101,5 +101,10 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     environment:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9093"
+      JDBC_URL: "jdbc:postgresql://postgres:5432/orders"
+      JDBC_USER: "orders"
+      JDBC_PASSWORD: "orders"
