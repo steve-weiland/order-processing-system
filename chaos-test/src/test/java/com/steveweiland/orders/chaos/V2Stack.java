@@ -37,7 +37,8 @@ final class V2Stack implements AutoCloseable {
         this.processedStore = new ProcessedOrdersStore();
         this.relay = new OutboxRelay(bootstrap, outboxStore, 100L);
         this.consumer = new FulfillmentConsumer(bootstrap, orderTopic, eventTopic, groupId,
-                consumerOverrides, ds, processedStore, outboxStore, dlq);
+                FulfillmentConsumer.DEFAULT_WORKER_POOL_SIZE, consumerOverrides,
+                ds, processedStore, outboxStore, dlq);
 
         this.relayWorker = new Thread(relay, "test-outbox-relay");
         this.consumerWorker = new Thread(consumer, "test-fulfillment-consumer");

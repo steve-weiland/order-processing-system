@@ -4,17 +4,18 @@ Event-driven order pipeline on **Java 21 + Apache Kafka + Postgres**, built to
 demonstrate the V1 → V2 transition that turns a naive at-most-once pipeline
 into one with **effectively-once** delivery semantics.
 
-V1 was deliberately broken in five well-known ways. V2 fixes four of them with
-three mechanisms: an **idempotency key table**, a **transactional outbox**, and
-a **dead letter queue**. Each fix is locked in by a deterministic chaos test
-whose assertion was inverted across the V1 → V2 commit boundary — that diff is
-the portfolio artifact.
+V1 was deliberately broken in five well-known ways. v2.0.0 fixed four of them
+(F1–F4) with three mechanisms: an **idempotency key table**, a **transactional
+outbox**, and a **dead letter queue**. v2.1.0 closes F5 (consumer lag) with
+**virtual-thread parallel batch processing** + **async outbox publish**. Each
+fix is locked in by a deterministic chaos test whose assertion was inverted
+across the V1 → V2 commit boundary — that diff is the portfolio artifact.
 
 | | |
 |--|--|
 | **Spec** | [`spec.md`](./spec.md) — RFC-2119 requirements, V1/V2 mapping |
 | **Chaos report** | [`docs/chaos-report.md`](./docs/chaos-report.md) — V1 baseline → V2 fix per failure |
-| **Status** | `v2.0.0` released (4/5 failure modes resolved). F5 deferred to `v2.1.0`. |
+| **Status** | `v2.1.0` released — all 5 V1 failure modes resolved. |
 
 ---
 
@@ -61,20 +62,20 @@ The V1 → V2 story, with the failing chaos test that drove each fix.
 | F2 | A consumer crash before the next auto-commit tick caused **redelivery** → second notification. | `enable.auto.commit=false` + `commitSync` after DB tx; redelivery hits the idempotency check and is skipped. | `F2_DuplicateNotificationsTest` — flipped from 2 → 1. |
 | F3 | Auto-commit advanced the offset before work completed → record **lost** on restart. | DB tx is the durability gate; `commitSync` runs only after `COMMIT` succeeds. | `F3_LostOrdersTest` — flipped from `assertEquals(0, …)` to `assertEquals(1, …)`. |
 | F4 | Malformed JSON crashed the consumer thread; the partition stalled. | Read as `byte[]`, parse manually; on parse failure, publish raw bytes to `orders.dlq` with diagnostic headers, commit the source offset, continue. | `F4_PoisonMessageTest` — flipped to assert `!consumer.crashed()`, valid event = 1, DLQ size = 1, headers populated. |
-| F5 | Single-thread × 50 ms / record → lag grew linearly under burst. | **Not addressed in v2.0.0** (correctness vs throughput). | `F5_ConsumerLagTest` — assertion unchanged: `lag > 200`. v2.1.0 will invert. |
+| F5 | Single-thread × 50 ms / record → lag grew linearly under burst. | **v2.1.0**: `poll()` batches dispatched onto a virtual-thread executor; per-batch `commitSync`; bounded by `--worker-pool-size` semaphore (default 32); outbox relay moved to async batch publish. | `F5_ConsumerLagTest` — flipped from `assertTrue(lag > 200)` to `assertTrue(lag < 50)`; measured lag = 0 in 2 s window. |
 
 Run the suite and watch the numbers come out:
 
 ```bash
 $ make chaos
 [INFO] Tests run: 1, in F1_DuplicateOrdersTest                Time: 4.9s   PASS
-[INFO] Tests run: 1, in F2_DuplicateNotificationsTest         Time: 8.7s   PASS
-[INFO] Tests run: 1, in F3_LostOrdersTest                     Time: 2.3s   PASS
+[INFO] Tests run: 1, in F2_DuplicateNotificationsTest         Time: 9.4s   PASS
+[INFO] Tests run: 1, in F3_LostOrdersTest                     Time: 3.7s   PASS
 [INFO] Tests run: 1, in F4_PoisonMessageTest                  Time: 3.8s   PASS
-[INFO] Tests run: 1, in F5_ConsumerLagTest                    Time: 2.5s   PASS
+[INFO] Tests run: 1, in F5_ConsumerLagTest                    Time: 3.0s   PASS
 
-=== chaos-test/target/lag-v2.txt ===
-burst=500 window=2s lag=469
+=== chaos-test/target/lag-v2.1.txt ===
+burst=500 window=2s lag=0
 ```
 
 For a deeper walkthrough of each test, the V1 baseline numbers, and the actual
@@ -110,11 +111,22 @@ times before giving up. V2 doesn't — a JSON parse failure is structural, not
 transient, and infinite retries would still fail. The retry topic is a
 v2.3.0 hardening pass.
 
-**Why F5 stays unfixed in v2.0.0.** Consumer lag is a throughput concern;
-v2.0.0's charter is correctness. Fixing F5 (parallel consumer,
-`max.poll.records` tuning) without first proving that v2.0.0 doesn't lose
-or duplicate orders would mean two unrelated changes interleaved. v2.1.0
-treats throughput as its own axis.
+**Fully-parallel batch processing, not per-key serial.** v2.1.0 dispatches
+every record in a `poll()` batch onto a virtual-thread executor with no
+ordering constraint. This works because of a **domain insight**: in this
+system, records with the same `orderId` are duplicates that the
+`processed_orders` idempotency check absorbs, and records with different
+`orderId` are independent. There is no per-key serialization requirement.
+If the domain ever grows one ("first cancel then place"), the right move
+is the [Confluent Parallel Consumer](https://github.com/confluentinc/parallel-consumer)
+with `KEY` ordering — not rolling our own per-key locks.
+
+**Atomic claim, not check-then-insert.** With v2.0.0's serial loop, the
+fulfillment-service did `SELECT 1 FROM processed_orders` then `INSERT`.
+That's a TOCTOU race the moment two workers run in parallel. v2.1.0
+collapsed it into a single `INSERT … ON CONFLICT DO NOTHING` that returns
+a row count: 1 = "we own this fulfillment, write the outbox row", 0 =
+"someone else won, skip". The check IS the insert.
 
 ---
 
@@ -232,7 +244,7 @@ order-processing-system/
 | Version | Theme | Scope |
 |---------|-------|-------|
 | `v2.0.0` ✅ | Correctness | F1–F4 fixed via idempotency + outbox + DLQ |
-| `v2.1.0` | Throughput | F5 fix — virtual-thread parallel batch processing in fulfillment-service; async outbox publish |
+| `v2.1.0` ✅ | Throughput | F5 fixed — virtual-thread parallel batch + async outbox publish; lag 469 → 0 |
 | `v2.2.0` | Multi-instance | `SELECT FOR UPDATE SKIP LOCKED` on outbox; horizontal scaling of fulfillment-service; partition count revisit |
 | `v2.3.0` | Hardening | Notification-side idempotency (closes the relay-crash duplicate window); retry-before-DLQ topic |
 | V3 | Architectural shift | Saga pattern (payment → inventory → ship); schema registry + Avro/Protobuf |

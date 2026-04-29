@@ -9,8 +9,8 @@ test:
 chaos:
 	mvn -ntp -P chaos -pl chaos-test -am test
 	@echo
-	@echo '=== chaos-test/target/lag-v2.txt ==='
-	@cat chaos-test/target/lag-v2.txt 2>/dev/null || echo '(not produced — F5 may have failed)'
+	@echo '=== chaos-test/target/lag-v2.1.txt ==='
+	@cat chaos-test/target/lag-v2.1.txt 2>/dev/null || echo '(not produced — F5 may have failed)'
 
 package:
 	mvn -ntp -DskipTests package

@@ -3,14 +3,17 @@ package com.steveweiland.orders.fulfillment;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -74,12 +77,25 @@ public final class OutboxRelay implements Runnable, AutoCloseable {
     /** Visible for tests so they can deterministically push the relay forward. */
     public int pollAndPublish() throws Exception {
         List<OutboxStore.Pending> pending = store.findUnpublished(BATCH);
+        if (pending.isEmpty()) return 0;
+
+        // Async batch publish: issue all sends, THEN await each future. v2.1.0
+        // change — replaces the v2.0.0 send-then-await-per-row loop. Producer
+        // is idempotent (acks=all + enable.idempotence=true), so retry
+        // collapsing within a single session is safe.
+        List<Future<RecordMetadata>> futures = new ArrayList<>(pending.size());
         for (OutboxStore.Pending p : pending) {
-            ProducerRecord<String, byte[]> rec = new ProducerRecord<>(p.topic(), p.recordKey(), p.payload());
-            producer.send(rec).get(10, TimeUnit.SECONDS);
-            store.markPublished(p.id());
+            futures.add(producer.send(new ProducerRecord<>(p.topic(), p.recordKey(), p.payload())));
         }
-        if (!pending.isEmpty()) log.info("relay published count={}", pending.size());
+        for (Future<RecordMetadata> f : futures) {
+            f.get(10, TimeUnit.SECONDS);
+        }
+
+        List<Long> ids = new ArrayList<>(pending.size());
+        for (OutboxStore.Pending p : pending) ids.add(p.id());
+        store.markPublishedBatch(ids);
+
+        log.info("relay published count={}", pending.size());
         return pending.size();
     }
 

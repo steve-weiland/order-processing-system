@@ -2,7 +2,7 @@
 
 | Field   | Value              |
 |---------|--------------------|
-| Version | 0.2 (draft)        |
+| Version | 0.3 (draft)        |
 | Author  | Steve Weiland      |
 | Date    | 2026-04-28         |
 | Status  | Draft              |
@@ -34,9 +34,22 @@ mechanisms:
    `orders.dlq` with diagnostic headers, the source offset is committed, and
    processing continues. The poison record no longer stalls the partition (F4).
 
-V2 is correctness-focused. **F5 (consumer lag under burst load) is deferred
-to v2.1.0** — throughput tuning, parallel consumers, and `max.poll.records`
-sizing are a separate axis from the durability and ordering work in v2.0.0.
+v2.1.0 adds a fourth mechanism on top of the v2.0.0 correctness work:
+
+4. **Parallel batch processing** — the fulfillment consumer dispatches each
+   `poll()` batch onto a virtual-thread executor (Java 21). Records are
+   processed concurrently, bounded by a configurable semaphore. Offsets are
+   committed only after the entire batch completes; a partial-batch failure
+   leaves all offsets in the batch uncommitted, relying on at-least-once
+   redelivery + `processed_orders` idempotency to converge. The outbox
+   relay also moves to async batch publish: all `producer.send` calls issue
+   before any await; `markPublished` becomes a single batched UPDATE.
+
+This is fundamentally enabled by a **domain insight**: in this system,
+records with the same `orderId` are duplicates absorbed by the idempotency
+check, and records with different `orderId` are independent. There is no
+per-key serial-ordering requirement, so the entire poll batch can be
+processed in parallel safely.
 
 ---
 
@@ -50,8 +63,12 @@ sizing are a separate axis from the durability and ordering work in v2.0.0.
 | Partition | An ordered subset of a topic; unit of parallelism and ordering |
 | Offset | The position of a record within a partition |
 | Consumer group | A set of consumers cooperatively consuming a topic |
-| Auto-commit | Consumer config that commits offsets on a background timer regardless of processing state. **Disabled in V2.** |
-| Manual commit | Application calls `commitSync` after work succeeds. **V2 default.** |
+| Auto-commit | Consumer config that commits offsets on a background timer regardless of processing state. **Disabled in v2.0.0.** |
+| Manual commit | Application calls `commitSync` after work succeeds. **v2.0.0 default.** |
+| Per-batch commit | `commitSync` runs once per `poll()` batch (not per record), only after every record in the batch has succeeded. **v2.1.0 default.** |
+| Order-independent processing | Property of this system: records with the same `orderId` are duplicates (absorbed by `processed_orders`); records with different `orderId` are independent. Allows fully-parallel batch processing without per-key serialization. |
+| Virtual thread | Java 21 lightweight thread (Project Loom). Cheap to create, doesn't pin an OS thread on blocking operations. v2.1.0 uses one virtual thread per record in a poll batch. |
+| Bounded concurrency | A semaphore caps the number of concurrent in-flight records. Defaults to `--worker-pool-size` (32). |
 | At-most-once | Delivery semantics in which a record may be lost but never duplicated |
 | At-least-once | Delivery semantics in which a record may be duplicated but never lost |
 | Effectively-once | At-least-once delivery + idempotent processing → each effect happens exactly once |
@@ -125,11 +142,14 @@ client ──POST /orders──▶ order-api ──▶ [orders] ──▶ fulfil
 | ID | Requirement |
 |----|-------------|
 | OPS-30 | `fulfillment-service` **MUST** subscribe to `orders` with `group.id=fulfillment`. |
-| OPS-31 | `fulfillment-service` **MUST** use `enable.auto.commit=false` and **MUST** call `commitSync` only after the DB transaction in OPS-33 has committed. *(Replaces V1 OPS-31 auto-commit.)* |
+| OPS-31 | `fulfillment-service` **MUST** use `enable.auto.commit=false`. *(Replaces V1 OPS-31 auto-commit.)* |
 | OPS-32 | `fulfillment-service` **MUST** deserialize records as `byte[]` and parse JSON manually. On parse failure see §3.11. |
 | OPS-33 | For a successfully-parsed `Order`, `fulfillment-service` **MUST** check `processed_orders` by `orderId`. If a row exists, the record **MUST** be skipped (idempotency, fixes F1/F2). If no row exists, the service **MUST** within a single Postgres transaction insert one row into `processed_orders` and one row into `outbox`. |
 | OPS-34 | The `outbox` row **MUST** carry the topic, key, and serialized payload of the `OrderFulfilled` event to be published. The Kafka publish itself **MUST NOT** happen inside this transaction. *(Decoupling DB durability from Kafka availability is the point of the outbox pattern.)* |
 | OPS-35 | `fulfillment-service` **MUST** simulate 50 ms of work between parse and DB transaction. *(Inherited V1 behavior; supports F5 baseline regression checks.)* |
+| OPS-36 | `fulfillment-service` **MUST** dispatch every record in a `poll()` batch onto a virtual-thread executor and process them concurrently. *(v2.1.0; fixes F5.)* |
+| OPS-37 | `fulfillment-service` **MUST** call `commitSync` exactly once per batch, only after every record in the batch has completed successfully. If any record fails, no offset in the batch **MUST** be committed; the batch is replayed at-least-once on the next poll, and the `processed_orders` idempotency check absorbs records that already wrote durable state. |
+| OPS-38 | The number of concurrent in-flight records **MUST** be capped by a semaphore configured via `--worker-pool-size` (default 32). *(Prevents runaway memory under pathological burst sizes; the underlying Hikari connection pool provides a second, lower bound.)* |
 
 ### 3.5 OrderFulfilled Message Format
 
@@ -181,7 +201,9 @@ client ──POST /orders──▶ order-api ──▶ [orders] ──▶ fulfil
 |----|-------------|
 | OPS-110 | A Postgres table `outbox` **MUST** exist with columns: `id` (bigserial, primary key), `aggregate_id` (text — the `orderId`), `topic` (text), `record_key` (text), `payload` (bytea), `created_at` (timestamptz, default `now()`), `published_at` (timestamptz, nullable). |
 | OPS-111 | `fulfillment-service` **MUST** insert the `processed_orders` row and the `outbox` row in a single Postgres transaction. The Kafka publish **MUST NOT** be part of this transaction. |
-| OPS-112 | A separate **outbox relay** thread inside `fulfillment-service` **MUST** poll `outbox WHERE published_at IS NULL ORDER BY id LIMIT 100` at a configurable interval (default 100 ms), publish each record to its `topic` via the Kafka producer, await broker ack, and `UPDATE outbox SET published_at = now() WHERE id = ?`. |
+| OPS-112 | A separate **outbox relay** thread inside `fulfillment-service` **MUST** poll `outbox WHERE published_at IS NULL ORDER BY id LIMIT 100` at a configurable interval (default 100 ms) and republish unpublished rows to Kafka. *(See OPS-117 / OPS-118 for v2.1.0 batching semantics.)* |
+| OPS-117 | The outbox relay **MUST** issue all `producer.send` calls in the polled batch *before* awaiting any individual ack, then await each `Future<RecordMetadata>` in turn. *(v2.1.0; replaces the v2.0.0 send-then-await-one-by-one loop.)* |
+| OPS-118 | After all `Future`s in the batch have completed, the relay **MUST** mark the entire batch published in a single `UPDATE outbox SET published_at = now() WHERE id = ANY(?)` statement. *(v2.1.0.)* |
 | OPS-113 | The outbox relay **MUST** use an idempotent producer (`enable.idempotence=true`, `acks=all`). Publish failures **MUST** be retried in the next poll cycle; the row stays unpublished until ack. |
 | OPS-114 | Database schema migrations **MUST** be managed by Flyway with migration files under `fulfillment-service/src/main/resources/db/migration/`. |
 | OPS-115 | The outbox relay **MUST** run in the same JVM process as the fulfillment consumer. *(Multi-instance fulfillment with `SELECT FOR UPDATE SKIP LOCKED` on outbox is v2.2.0 work.)* |
@@ -302,6 +324,7 @@ fulfillment-service
   --jdbc-user           string
   --jdbc-password       string
   --outbox-poll-ms      int     Outbox relay poll interval (default 100)
+  --worker-pool-size    int     Max concurrent in-flight records (default 32)
 
 notification-service
   --bootstrap-servers   string
@@ -315,10 +338,6 @@ Deferred to v2.1.0 / v2.2.0 / v2.3.0+ as marked. Anything that fundamentally
 re-architects the system (Kafka transactions in place of outbox, sagas across
 multiple aggregates, etc.) is V3 territory.
 
-- **F5 — consumer lag under burst load** *(v2.1.0)*. v2.0.0 is correctness-focused;
-  throughput tuning (intra-instance parallelism via virtual threads,
-  `max.poll.records` sizing, async outbox publish) is v2.1.0. The F5 chaos
-  test continues to assert the v2.0.0 lag baseline.
 - **Multi-instance fulfillment** *(v2.2.0)*. Multiple fulfillment-service
   replicas need `SELECT FOR UPDATE SKIP LOCKED` on the outbox poll to avoid
   duplicate publishes; partition count likely bumps from 3 → 6+.
@@ -347,7 +366,7 @@ implement it.
 | F2 | Duplicate notifications after consumer crash | Auto-commit hadn't fired → record redelivered → second event | `enable.auto.commit=false` + `commitSync` after DB transaction; idempotency check absorbs redelivery | OPS-31, OPS-101 |
 | F3 | Lost orders after premature commit | Auto-commit advanced past unprocessed record | `commitSync` only after DB transaction commits; durable state is the gate, not the timer | OPS-31, OPS-111 |
 | F4 | Poison message stalls partition | Deserialization exception killed consumer thread | Deserialize as `byte[]`, parse manually; route parse failures to `orders.dlq` and continue | OPS-32, OPS-121, OPS-122 |
-| F5 | Consumer lag under burst load | 50 ms work × single thread → linear lag growth | **Not addressed in v2.0.0.** Throughput work deferred to v2.1.0. | — |
+| F5 | Consumer lag under burst load | 50 ms work × single thread → linear lag growth | Virtual-thread parallel batch processing in fulfillment-service; bounded concurrency via semaphore; per-batch `commitSync`; async outbox publish | OPS-36, OPS-37, OPS-38, OPS-117, OPS-118 |
 
 The chaos test suite at `chaos-test/` retains its V1-baseline assertions for
 all five tests. V2 implementation work flips F1–F4 assertions to require the
@@ -359,7 +378,7 @@ fix; F5 assertion stays as-is and is the v2.1.0 entry point.
 | F2 | `F2_DuplicateNotificationsTest` | `assertEquals(2, events.size())` | `assertEquals(1, events.size())` |
 | F3 | `F3_LostOrdersTest` | `assertEquals(0, events.size())` | `assertEquals(1, events.size())` |
 | F4 | `F4_PoisonMessageTest` | `assertTrue(consumer.crashed())`, `assertEquals(0, validEvents)` | `assertFalse(consumer.crashed())`, `assertEquals(1, validEvents)`, `assertEquals(1, dlqRecords)` |
-| F5 | `F5_ConsumerLagTest` | `assertTrue(lag > 200)` | unchanged in v2.0.0 — v2.1.0 will invert |
+| F5 | `F5_ConsumerLagTest` | `assertTrue(lag > 200)` | flipped in v2.1.0: `assertTrue(lag < 50)` |
 
 ---
 
@@ -383,6 +402,11 @@ V1 entries Q1–Q7 are unchanged; V2 adds Q8–Q14.
 | Q12 | `Idempotency-Key` header on `POST /orders`? | **Optional**, with 24 h TTL on the key→orderId mapping. Matches Stripe/Shopify conventions and provides HTTP-layer dedup before any record reaches Kafka. |
 | Q13 | DB migration tool? | **Flyway**, migrations under `fulfillment-service/src/main/resources/db/migration/`. Idiomatic Java, zero runtime config. |
 | Q14 | F5 (consumer lag) in v2.0.0 scope? | **Deferred to v2.1.0.** v2.0.0 is correctness; F5 is throughput. F5 chaos test stays asserting the V1 lag baseline; v2.1.0 inverts it. |
+| Q15 | Virtual threads (Java 21) or Confluent Parallel Consumer library? | **Virtual threads.** ~30 lines of code; `Executors.newVirtualThreadPerTaskExecutor()` is the right primitive; no extra dep; portfolio signal for Java 21 idioms. Confluent Parallel Consumer wins iff per-key ordering becomes a domain requirement (it isn't). |
+| Q16 | Fully-parallel within a batch, or per-key serial? | **Fully-parallel.** Idempotency makes ordering irrelevant in this domain (see §2 "Order-independent processing"). Per-key serial would force a `groupBy(orderId)` step for no correctness benefit. |
+| Q17 | Bounded or unbounded concurrency? | **Bounded** via semaphore at `--worker-pool-size` (default 32). Virtual threads are cheap, but DB connections aren't (Hikari pool size 16). The semaphore protects against pathological bursts; the connection pool provides the secondary bound. |
+| Q18 | Commit cadence? | **Per-batch.** One `commitSync` per `poll()` instead of N. Reduces commit overhead and matches the all-or-nothing batch-failure semantics (OPS-37). |
+| Q19 | Outbox relay: per-row send or async batch? | **Async batch.** Issue all `producer.send` calls before awaiting any future, then batch the `markPublished` UPDATE. Order-of-magnitude faster than v2.0.0's serial loop on the same workload. |
 
 ---
 
@@ -400,3 +424,4 @@ V1 entries Q1–Q7 are unchanged; V2 adds Q8–Q14.
 |---------|------|--------|-------|
 | 0.1 | 2026-04-24 | Steve Weiland | Initial V1 draft — three services, auto-commit, no idempotency, no DLQ |
 | 0.2 | 2026-04-28 | Steve Weiland | v2.0.0: Postgres + idempotency table (F1, F2 fix), transactional outbox + manual commit (F2, F3 fix), DLQ for poison messages (F4 fix). F5 deferred to v2.1.0. |
+| 0.3 | 2026-04-28 | Steve Weiland | v2.1.0: virtual-thread parallel batch processing in fulfillment-service (F5 fix); per-batch `commitSync`; bounded concurrency via `--worker-pool-size` semaphore; async outbox relay publish + batched `markPublished`. New OPS-36, OPS-37, OPS-38, OPS-117, OPS-118; resolved Q15-Q19. |

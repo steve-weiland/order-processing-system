@@ -19,14 +19,22 @@ public final class ProcessedOrdersStore {
         }
     }
 
-    public void insert(Connection c, String orderId, String customerId, Instant fulfilledAt) throws SQLException {
+    /**
+     * Atomically claim the orderId. Returns {@code true} if this caller
+     * inserted the row (and therefore "owns" the fulfillment), {@code false}
+     * if another transaction had already inserted it. The check-then-insert
+     * race that v2.0.0's separate {@link #exists} could miss under v2.1.0
+     * parallel batch processing is closed by the {@code ON CONFLICT … DO
+     * NOTHING}: only one of N concurrent workers receives a row count of 1.
+     */
+    public boolean insert(Connection c, String orderId, String customerId, Instant fulfilledAt) throws SQLException {
         try (PreparedStatement ps = c.prepareStatement(
                 "INSERT INTO processed_orders (order_id, customer_id, fulfilled_at) " +
                         "VALUES (?::uuid, ?, ?) ON CONFLICT (order_id) DO NOTHING")) {
             ps.setString(1, orderId);
             ps.setString(2, customerId);
             ps.setTimestamp(3, Timestamp.from(fulfilledAt));
-            ps.executeUpdate();
+            return ps.executeUpdate() == 1;
         }
     }
 }

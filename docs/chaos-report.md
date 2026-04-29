@@ -287,55 +287,86 @@ $ make psql
 A single consumer with 50 ms simulated work cannot keep up with a 500-record
 burst. Lag grew linearly; notifications arrived minutes late.
 
-### V1 baseline
+### Baseline timeline
 
-V1 chaos run (`chaos-test/target/lag-v1.txt`):
+| Version | Lag at t=2 s (after 500-record burst) | Mechanism |
+|---------|---------------------------------------|-----------|
+| V1 | 500 (33 processed) | single-thread, auto-commit |
+| v2.0.0 | 469 | single-thread, manual commit (slightly more per-record overhead) |
+| **v2.1.0** | **0** | virtual-thread parallel batch + async outbox publish |
+
+Real artifacts captured during chaos runs:
 
 ```
+$ cat chaos-test/target/lag-v1.txt
 burst=500 window=2s lag=500 store=33
+
+$ cat chaos-test/target/lag-v2.1.txt
+burst=500 window=2s lag=0
 ```
 
-Within a 2-second observation window, 33 records had been processed; lag
-across the consumer group was the full 500.
+### v2.1.0 fix
 
-### V2 status
+Three changes in [`FulfillmentConsumer.java`](../fulfillment-service/src/main/java/com/steveweiland/orders/fulfillment/FulfillmentConsumer.java):
 
-**V2 does not address F5.** Throughput and correctness are different axes;
-V2's charter was correctness. The same single-thread / 50 ms-per-record
-shape is preserved.
+1. **Virtual-thread executor** — `Executors.newVirtualThreadPerTaskExecutor()`.
+   Every record in a `poll()` batch is submitted as its own task. Java 21
+   virtual threads don't pin OS threads on `Thread.sleep` or DB I/O.
+2. **Bounded concurrency** — a `Semaphore` capped by `--worker-pool-size`
+   (default 32) keeps in-flight work bounded so a pathological burst can't
+   exhaust memory. The Hikari pool (16) is the secondary, lower bound.
+3. **Per-batch commit** — `commitSync` runs once per batch with the highest
+   successful offset per partition. If any record fails, *no* offset
+   advances; the batch is replayed and the `processed_orders` idempotency
+   check (now an atomic `INSERT … ON CONFLICT DO NOTHING`) absorbs records
+   that already wrote durable state.
 
-### V2 number
+Plus one change in [`OutboxRelay.pollAndPublish`](../fulfillment-service/src/main/java/com/steveweiland/orders/fulfillment/OutboxRelay.java):
 
-V2 chaos run (`chaos-test/target/lag-v2.txt`, captured during the most
-recent suite execution):
+4. **Async batch publish** — the relay now issues every `producer.send()` in
+   the polled batch *before* awaiting any future, then awaits each. After
+   all acks, a single batched `UPDATE outbox SET published_at = now() WHERE
+   id = ANY(?)` marks the whole batch published.
+
+### A race we found and fixed
+
+v2.0.0 used `SELECT exists() THEN INSERT processed_orders`. With v2.1.0
+parallelism, two workers in the same poll batch (or split between consumer
+and outbox-relay redelivery) could both pass the `SELECT`, both proceed to
+the INSERT, and both write outbox rows for the same orderId — even though
+the second INSERT was a no-op due to the PK constraint. F1 went red on the
+first parallel run.
+
+The fix is structural: collapse the check and the insert into a single
+atomic statement and use the row count to decide.
+
+```diff
+- if (processedStore.exists(c, order.orderId())) {
+-     c.commit(); return;
+- }
+- processedStore.insert(c, order.orderId(), order.customerId(), fulfilledAt);
+- outboxStore.insert(c, …);
++ boolean claimed = processedStore.insert(c, order.orderId(),
++         order.customerId(), fulfilledAt);
++ if (!claimed) {
++     c.commit(); return;
++ }
++ outboxStore.insert(c, …);
+```
+
+The `INSERT` IS the check. There is no window between them.
+
+### Evidence — assertion flip
+
+```diff
+- assertTrue(lag > 200, "v2.0.0 keeps the V1 baseline assertion. v2.1.0 will invert.");
++ assertTrue(lag < LAG_THRESHOLD,
++         "v2.1.0 fix: expected lag < " + LAG_THRESHOLD + ", got " + lag);
+```
 
 ```
-burst=500 window=2s lag=469
+[INFO] Tests run: 1 in F5_ConsumerLagTest    Time: 3.0 s    PASS
 ```
-
-A few records *less* lag than V1 because V2 commits per-record (slightly
-more overhead) but still in the same order of magnitude. The V1 assertion
-(`lag > 200`) is preserved in V2.
-
-### Evidence — assertion unchanged
-
-```java
-assertTrue(lag > 200, "v2.0.0 keeps the V1 baseline assertion. v2.1.0 will invert.");
-```
-
-```
-[INFO] Tests run: 1 in F5_ConsumerLagTest    Time: 2.5 s    PASS
-```
-
-### v2.1.0 plan
-
-- Dispatch each `poll()` batch onto a virtual-thread executor; commit only
-  after all records in the batch complete (idempotency absorbs retries on
-  partial-batch failure)
-- Convert outbox relay to async batch publish (issue all `producer.send`,
-  await futures, batched `markPublished` UPDATE)
-- Re-run with the same 500-record burst; expect lag drop by 10×+
-- Invert F5 assertion (`lag < threshold`) and capture `lag-v2.1.txt`
 
 ---
 
@@ -379,15 +410,14 @@ $ make psql
 | F2 | 2 events | 1 event | `commitSync` after DB tx + idempotency | `F2_DuplicateNotificationsTest` |
 | F3 | 0 events (lost) | 1 event | DB tx is the durability gate | `F3_LostOrdersTest` |
 | F4 | consumer crashed, partition stalled | consumer survived, DLQ has 1, valid event = 1 | `byte[]` deserialize + DLQ routing | `F4_PoisonMessageTest` |
-| F5 | lag 500 / 2s | lag 469 / 2s — **unchanged** | (v2.1.0) | `F5_ConsumerLagTest` |
+| F5 | lag 500 / 2s | lag 0 / 2s | virtual-thread parallel batch + async outbox publish (v2.1.0) | `F5_ConsumerLagTest` |
 
 V2 chaos suite total runtime: **~25 s** (Testcontainers spin-up + 5 tests).
 
 ---
 
-## Known v2.0.0 limitations (deferred to v2.x)
+## Known v2.x limitations (deferred)
 
-- **F5 lag** *(v2.1.0)* — documented above.
 - **Single-instance fulfillment** *(v2.2.0)*. Multiple replicas would race on
   `outbox` polling. Closed with `SELECT FOR UPDATE SKIP LOCKED` on the
   outbox query.

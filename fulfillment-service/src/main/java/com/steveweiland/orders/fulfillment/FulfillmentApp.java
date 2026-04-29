@@ -9,6 +9,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.Map;
 
 public final class FulfillmentApp {
     private static final Logger log = LoggerFactory.getLogger(FulfillmentApp.class);
@@ -26,6 +27,9 @@ public final class FulfillmentApp {
                 System.getenv().getOrDefault("JDBC_PASSWORD", "orders"));
         long pollMs = Long.parseLong(strFlag(args, "--outbox-poll-ms",
                 System.getenv().getOrDefault("OUTBOX_POLL_MS", "100")));
+        int workerPoolSize = Integer.parseInt(strFlag(args, "--worker-pool-size",
+                System.getenv().getOrDefault("WORKER_POOL_SIZE",
+                        String.valueOf(FulfillmentConsumer.DEFAULT_WORKER_POOL_SIZE))));
 
         TopicAdmin.ensure(bootstrap, List.of(
                 new NewTopic("orders", 3, (short) 1),
@@ -40,7 +44,14 @@ public final class FulfillmentApp {
         DlqProducer dlq = new DlqProducer(bootstrap);
 
         OutboxRelay relay = new OutboxRelay(bootstrap, outboxStore, pollMs);
-        FulfillmentConsumer consumer = new FulfillmentConsumer(bootstrap, ds, processedStore, outboxStore, dlq);
+        FulfillmentConsumer consumer = new FulfillmentConsumer(
+                bootstrap,
+                FulfillmentConsumer.DEFAULT_TOPIC,
+                FulfillmentConsumer.DEFAULT_EVENTS_TOPIC,
+                FulfillmentConsumer.DEFAULT_GROUP_ID,
+                workerPoolSize,
+                Map.of(),
+                ds, processedStore, outboxStore, dlq);
 
         Thread relayWorker = new Thread(relay, "outbox-relay");
         Thread consumerWorker = new Thread(consumer, "fulfillment-consumer");
@@ -56,7 +67,8 @@ public final class FulfillmentApp {
             ds.close();
         }, "fulfillment-shutdown"));
 
-        log.info("fulfillment-service starting bootstrap={} jdbc={} pollMs={}", bootstrap, jdbcUrl, pollMs);
+        log.info("fulfillment-service starting bootstrap={} jdbc={} pollMs={} workers={}",
+                bootstrap, jdbcUrl, pollMs, workerPoolSize);
         relayWorker.start();
         consumerWorker.start();
         try {

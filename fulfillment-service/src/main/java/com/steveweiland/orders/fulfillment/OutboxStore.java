@@ -55,5 +55,18 @@ public final class OutboxStore {
         }
     }
 
+    public void markPublishedBatch(java.util.List<Long> ids) {
+        if (ids.isEmpty()) return;
+        try (Connection c = ds.getConnection();
+             PreparedStatement ps = c.prepareStatement(
+                     "UPDATE outbox SET published_at = now() WHERE id = ANY(?)")) {
+            Long[] arr = ids.toArray(Long[]::new);
+            ps.setArray(1, c.createArrayOf("BIGINT", arr));
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new RuntimeException("outbox mark-published-batch failed for n=" + ids.size(), e);
+        }
+    }
+
     public record Pending(long id, String topic, String recordKey, byte[] payload) {}
 }

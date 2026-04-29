@@ -8,6 +8,7 @@ import org.apache.kafka.clients.admin.ListOffsetsResult.ListOffsetsResultInfo;
 import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
+import org.awaitility.Awaitility;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
@@ -15,6 +16,7 @@ import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
@@ -28,19 +30,29 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * F5 — Consumer lag under burst load. (spec.md §6 F5)
  *
- * V2 does NOT address F5. The same V1-baseline assertion (lag &gt; 200) is
- * expected to hold in V2 — the consumer still does 50 ms of work per record
- * and runs single-threaded per partition. V3 will introduce parallel consumers
- * or {@code max.poll.records} tuning to make this lag go away.
+ * V1 baseline: lag &gt; 200 records 2 s into a 500-record burst.
+ * v2.0.0 unchanged: still single-thread sequential processing.
+ * v2.1.0 fix: virtual-thread parallel batch processing inside the
+ * fulfillment consumer + async outbox publish drains the entire 500-record
+ * burst inside the 2 s window. The same assertion is now flipped:
+ * {@code assertTrue(lag &lt; LAG_THRESHOLD)}.
+ *
+ * v2.2.0 (multi-instance) keeps this assertion intact and additionally
+ * verifies that horizontally scaling the fulfillment-service does not
+ * introduce duplicate publishes from outbox-poll races.
  */
 @Tag("chaos")
 class F5_ConsumerLagTest extends KafkaTestFixture {
 
     private static final int BURST = 500;
-    private static final int LAG_THRESHOLD = 200;
+    /**
+     * v2.1.0 measured: lag = 0 records 2 s into the burst.
+     * Threshold of 50 leaves headroom for CI jitter / GC pauses.
+     */
+    private static final int LAG_THRESHOLD = 50;
 
     @Test
-    void slowConsumerBuildsLagUnderBurst() throws Exception {
+    void parallelBatchConsumerDrainsBurstWithinWindow() throws Exception {
         OrderProducer producer = new OrderProducer(bootstrap(), orderTopic);
         for (int i = 0; i < BURST; i++) {
             Order order = new Order(
@@ -59,16 +71,16 @@ class F5_ConsumerLagTest extends KafkaTestFixture {
             Thread.sleep(2000);
             long lag = measureLag();
 
-            Path artifact = Path.of("target/lag-v2.txt");
+            Path artifact = Path.of("target/lag-v2.1.txt");
             try {
                 Files.createDirectories(artifact.getParent());
                 Files.writeString(artifact,
                         "burst=" + BURST + " window=2s lag=" + lag + "\n");
             } catch (IOException ignored) {}
 
-            assertTrue(lag > LAG_THRESHOLD,
-                    "V2 keeps the V1 baseline assertion: expected lag > " + LAG_THRESHOLD
-                            + ", got " + lag + ". V3 will invert this.");
+            assertTrue(lag < LAG_THRESHOLD,
+                    "v2.1.0 fix: expected lag < " + LAG_THRESHOLD + ", got " + lag
+                            + ". F5 should now drain inside the burst window.");
         }
     }
 
