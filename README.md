@@ -14,7 +14,7 @@ the portfolio artifact.
 |--|--|
 | **Spec** | [`spec.md`](./spec.md) — RFC-2119 requirements, V1/V2 mapping |
 | **Chaos report** | [`docs/chaos-report.md`](./docs/chaos-report.md) — V1 baseline → V2 fix per failure |
-| **Status** | V2 (4/5 failure modes resolved). F5 deferred to V3. |
+| **Status** | `v2.0.0` released (4/5 failure modes resolved). F5 deferred to `v2.1.0`. |
 
 ---
 
@@ -61,7 +61,7 @@ The V1 → V2 story, with the failing chaos test that drove each fix.
 | F2 | A consumer crash before the next auto-commit tick caused **redelivery** → second notification. | `enable.auto.commit=false` + `commitSync` after DB tx; redelivery hits the idempotency check and is skipped. | `F2_DuplicateNotificationsTest` — flipped from 2 → 1. |
 | F3 | Auto-commit advanced the offset before work completed → record **lost** on restart. | DB tx is the durability gate; `commitSync` runs only after `COMMIT` succeeds. | `F3_LostOrdersTest` — flipped from `assertEquals(0, …)` to `assertEquals(1, …)`. |
 | F4 | Malformed JSON crashed the consumer thread; the partition stalled. | Read as `byte[]`, parse manually; on parse failure, publish raw bytes to `orders.dlq` with diagnostic headers, commit the source offset, continue. | `F4_PoisonMessageTest` — flipped to assert `!consumer.crashed()`, valid event = 1, DLQ size = 1, headers populated. |
-| F5 | Single-thread × 50 ms / record → lag grew linearly under burst. | **Not addressed in V2** (correctness vs throughput). | `F5_ConsumerLagTest` — assertion unchanged: `lag > 200`. V3 will invert. |
+| F5 | Single-thread × 50 ms / record → lag grew linearly under burst. | **Not addressed in v2.0.0** (correctness vs throughput). | `F5_ConsumerLagTest` — assertion unchanged: `lag > 200`. v2.1.0 will invert. |
 
 Run the suite and watch the numbers come out:
 
@@ -107,14 +107,14 @@ opens a duplicate window.
 
 **Straight-to-DLQ on first parse failure.** Production-grade systems retry N
 times before giving up. V2 doesn't — a JSON parse failure is structural, not
-transient, and infinite retries would still fail. The retry topic is a V3
-hardening pass.
+transient, and infinite retries would still fail. The retry topic is a
+v2.3.0 hardening pass.
 
-**Why F5 stays unfixed in V2.** Consumer lag is a throughput concern; V2's
-charter is correctness. Fixing F5 (parallel consumer, `max.poll.records`
-tuning) without first proving that V2 doesn't lose or duplicate orders would
-mean two unrelated changes interleaved. V3 will treat throughput as its own
-axis.
+**Why F5 stays unfixed in v2.0.0.** Consumer lag is a throughput concern;
+v2.0.0's charter is correctness. Fixing F5 (parallel consumer,
+`max.poll.records` tuning) without first proving that v2.0.0 doesn't lose
+or duplicate orders would mean two unrelated changes interleaved. v2.1.0
+treats throughput as its own axis.
 
 ---
 
@@ -227,14 +227,15 @@ order-processing-system/
 
 ---
 
-## What's next (V3)
+## Roadmap
 
-- **F5** — parallel consumer or `max.poll.records` tuning to drain the lag baseline
-- **Notification-side idempotency** — closes the relay-crash duplicate-publish window left open by V2's at-least-once relay
-- **Retry-before-DLQ** — separate retry topic with bounded attempts
-- **Distributed outbox relay** — leader election; multi-instance deployment
-- **Saga pattern** — payment → inventory → ship with compensating actions
-- **Schema registry** — Avro or Protobuf
+| Version | Theme | Scope |
+|---------|-------|-------|
+| `v2.0.0` ✅ | Correctness | F1–F4 fixed via idempotency + outbox + DLQ |
+| `v2.1.0` | Throughput | F5 fix — virtual-thread parallel batch processing in fulfillment-service; async outbox publish |
+| `v2.2.0` | Multi-instance | `SELECT FOR UPDATE SKIP LOCKED` on outbox; horizontal scaling of fulfillment-service; partition count revisit |
+| `v2.3.0` | Hardening | Notification-side idempotency (closes the relay-crash duplicate window); retry-before-DLQ topic |
+| V3 | Architectural shift | Saga pattern (payment → inventory → ship); schema registry + Avro/Protobuf |
 
 ---
 

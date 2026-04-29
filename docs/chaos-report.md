@@ -320,20 +320,22 @@ more overhead) but still in the same order of magnitude. The V1 assertion
 ### Evidence — assertion unchanged
 
 ```java
-assertTrue(lag > 200, "V2 keeps the V1 baseline assertion. V3 will invert.");
+assertTrue(lag > 200, "v2.0.0 keeps the V1 baseline assertion. v2.1.0 will invert.");
 ```
 
 ```
 [INFO] Tests run: 1 in F5_ConsumerLagTest    Time: 2.5 s    PASS
 ```
 
-### V3 plan
+### v2.1.0 plan
 
-- Increase `max.poll.records` and parallelize processing inside the
-  consumer (per-partition virtual-thread workers, or
-  [Confluent's parallel consumer](https://github.com/confluentinc/parallel-consumer))
-- Re-run with the same 500-record burst; expect lag near zero
-- Invert the F5 assertion to `lag < 50` and capture `lag-v3.txt`
+- Dispatch each `poll()` batch onto a virtual-thread executor; commit only
+  after all records in the batch complete (idempotency absorbs retries on
+  partial-batch failure)
+- Convert outbox relay to async batch publish (issue all `producer.send`,
+  await futures, batched `markPublished` UPDATE)
+- Re-run with the same 500-record burst; expect lag drop by 10×+
+- Invert F5 assertion (`lag < threshold`) and capture `lag-v2.1.txt`
 
 ---
 
@@ -377,22 +379,23 @@ $ make psql
 | F2 | 2 events | 1 event | `commitSync` after DB tx + idempotency | `F2_DuplicateNotificationsTest` |
 | F3 | 0 events (lost) | 1 event | DB tx is the durability gate | `F3_LostOrdersTest` |
 | F4 | consumer crashed, partition stalled | consumer survived, DLQ has 1, valid event = 1 | `byte[]` deserialize + DLQ routing | `F4_PoisonMessageTest` |
-| F5 | lag 500 / 2s | lag 469 / 2s — **unchanged** | (V3) | `F5_ConsumerLagTest` |
+| F5 | lag 500 / 2s | lag 469 / 2s — **unchanged** | (v2.1.0) | `F5_ConsumerLagTest` |
 
 V2 chaos suite total runtime: **~25 s** (Testcontainers spin-up + 5 tests).
 
 ---
 
-## Known V2 limitations (deferred to V3)
+## Known v2.0.0 limitations (deferred to v2.x)
 
-- **Relay-crash duplicate-publish window.** The outbox relay is at-least-once.
-  If the JVM crashes between `producer.send().get()` and
+- **F5 lag** *(v2.1.0)* — documented above.
+- **Single-instance fulfillment** *(v2.2.0)*. Multiple replicas would race on
+  `outbox` polling. Closed with `SELECT FOR UPDATE SKIP LOCKED` on the
+  outbox query.
+- **Relay-crash duplicate-publish window** *(v2.3.0)*. The outbox relay is
+  at-least-once; if the JVM crashes between `producer.send().get()` and
   `UPDATE outbox SET published_at = now()`, the next loop republishes — and
   notification-service has no idempotency. One duplicate notification per
-  relay crash. Closes with notification-side dedup *(V3)*.
-- **No retry-before-DLQ.** First parse failure routes straight to DLQ. Fine
-  for malformed JSON; less fine for transient downstream failures *(V3)*.
-- **Single-instance fulfillment.** Multiple replicas would race on
-  `outbox` polling. Either single-leader election or `SELECT FOR UPDATE
-  SKIP LOCKED` on the outbox poll *(V3)*.
-- **F5 lag.** Documented above.
+  relay crash. Closes with notification-side dedup.
+- **No retry-before-DLQ** *(v2.3.0)*. First parse failure routes straight
+  to DLQ. Fine for malformed JSON; less fine for transient downstream
+  failures.
