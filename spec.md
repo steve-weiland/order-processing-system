@@ -2,7 +2,7 @@
 
 | Field   | Value              |
 |---------|--------------------|
-| Version | 0.5 (draft)        |
+| Version | 0.6 (draft)        |
 | Author  | Steve Weiland      |
 | Date    | 2026-04-29         |
 | Status  | Draft              |
@@ -83,6 +83,10 @@ processed in parallel safely.
 | Order | A customer purchase request: customer ID, line items, total |
 | Order event | A downstream event emitted after an order reaches a terminal state (e.g. `OrderFulfilled`) |
 | Order ID | UUIDv4 assigned by `order-api` when an order is accepted |
+| Saga | A sequence of local transactions where each transaction has a defined compensating transaction. *(V3.0.0)* |
+| Orchestrated saga | A single coordinator drives the saga's steps in order, in contrast to *choreography* where each step subscribes to events from the previous one. V3.0.0 uses orchestration. |
+| Saga step | One local transaction with `execute()` and `compensate()` methods. V3.0.0 has three: `payment`, `inventory`, `shipping`. |
+| Compensating action | An operation that semantically undoes a completed step (refund payment, release reserved stock, cancel shipment). |
 
 ---
 
@@ -144,9 +148,8 @@ client ──POST /orders──▶ order-api ──▶ [orders] ──▶ fulfil
 | OPS-30 | `fulfillment-service` **MUST** subscribe to `orders` with `group.id=fulfillment`. |
 | OPS-31 | `fulfillment-service` **MUST** use `enable.auto.commit=false`. *(Replaces V1 OPS-31 auto-commit.)* |
 | OPS-32 | `fulfillment-service` **MUST** deserialize records as `byte[]` and parse JSON manually. On parse failure see §3.11. |
-| OPS-33 | For a successfully-parsed `Order`, `fulfillment-service` **MUST** check `processed_orders` by `orderId`. If a row exists, the record **MUST** be skipped (idempotency, fixes F1/F2). If no row exists, the service **MUST** within a single Postgres transaction insert one row into `processed_orders` and one row into `outbox`. |
+| OPS-33 | For a successfully-parsed `Order`, `fulfillment-service` **MUST** invoke the saga orchestrator (§3.13) and wait for it to terminate. On `COMPLETED`, the service **MUST** within a single Postgres transaction insert one row into `processed_orders` and one row into `outbox`. On `FAILED`, the service **MUST** insert one row into `processed_orders` (idempotency) and **MUST NOT** insert an outbox row. *(V3.0.0; replaces the V2.x `Thread.sleep(50) + INSERT` shape.)* |
 | OPS-34 | The `outbox` row **MUST** carry the topic, key, and serialized payload of the `OrderFulfilled` event to be published. The Kafka publish itself **MUST NOT** happen inside this transaction. *(Decoupling DB durability from Kafka availability is the point of the outbox pattern.)* |
-| OPS-35 | `fulfillment-service` **MUST** simulate 50 ms of work between parse and DB transaction. *(Inherited V1 behavior; supports F5 baseline regression checks.)* |
 | OPS-36 | `fulfillment-service` **MUST** dispatch every record in a `poll()` batch onto a virtual-thread executor and process them concurrently. *(v2.1.0; fixes F5.)* |
 | OPS-37 | `fulfillment-service` **MUST** call `commitSync` exactly once per batch, only after every record in the batch has completed successfully. If any record fails, no offset in the batch **MUST** be committed; the batch is replayed at-least-once on the next poll, and the `processed_orders` idempotency check absorbs records that already wrote durable state. |
 | OPS-38 | The number of concurrent in-flight records **MUST** be capped by a semaphore configured via `--worker-pool-size` (default 32). *(Prevents runaway memory under pathological burst sizes; the underlying Hikari connection pool provides a second, lower bound.)* |
@@ -210,6 +213,35 @@ client ──POST /orders──▶ order-api ──▶ [orders] ──▶ fulfil
 | OPS-114 | Database schema migrations **MUST** be managed by Flyway with migration files under `fulfillment-service/src/main/resources/db/migration/`. |
 | OPS-115 | The outbox relay **MUST** run in the same JVM process as the fulfillment consumer. *(v2.2.0)* The relay **MAY** run concurrently across multiple JVM instances against the same Postgres; row-level locks acquired by `FOR UPDATE SKIP LOCKED` ensure that each unpublished row is published by exactly one instance. |
 | OPS-116 | The outbox relay's Kafka publish loop **MUST** be at-least-once semantics. Duplicate publishes are absorbed by `processed_orders` for upstream dedup; duplicate `order-events` records observed by `notification-service` are a known V2 limitation (see §3.6 OPS-53). |
+
+### 3.13 Saga Orchestrator
+
+| ID | Requirement |
+|----|-------------|
+| OPS-200 | `fulfillment-service` **MUST** run a saga orchestrator for every new order with three steps in fixed order: payment → inventory → shipping. |
+| OPS-201 | The orchestrator **MUST** persist saga state transitions to the `sagas` table before invoking each step and after each step's success or failure. |
+| OPS-202 | If any step fails, the orchestrator **MUST** invoke `compensate()` on every previously-completed step in reverse order. |
+| OPS-203 | The orchestrator **MUST** be resumable. On startup or redelivery, if a `sagas` row exists for the orderId in a non-terminal state, the orchestrator **MUST** continue from that state without re-executing already-completed steps. |
+| OPS-204 | A saga **MUST** be terminal when reaching `COMPLETED` (success path) or `FAILED` (compensation completed, or no compensation needed). Terminal states **MUST** short-circuit on re-entry. |
+
+### 3.14 Saga State
+
+| ID | Requirement |
+|----|-------------|
+| OPS-210 | A Postgres table `sagas` **MUST** exist with columns: `saga_id` UUID PK (= `order_id`), `order_id` UUID UNIQUE, `state` text, `payment_done_at`, `inventory_done_at`, `shipping_done_at` timestamptz nullable, `failure_step` text nullable, `failure_reason` text nullable, `created_at`, `updated_at` timestamptz. |
+| OPS-211 | Valid `state` values: `PAYMENT_PENDING`, `INVENTORY_PENDING`, `SHIPPING_PENDING`, `COMPLETED`, `COMPENSATING_INVENTORY`, `COMPENSATING_PAYMENT`, `FAILED`. |
+| OPS-212 | The orchestrator **MUST** start a saga via an atomic `INSERT … ON CONFLICT DO NOTHING` and resume from the existing row on conflict. The atomic insert is the gate against double-starting a saga under concurrent redelivery or rebalance. |
+| OPS-213 | State transitions **MUST** be implemented as compare-and-swap UPDATEs (`UPDATE … SET state = 'TO' WHERE saga_id = ? AND state = 'FROM'`) so two attempts cannot both advance from the same state. |
+
+### 3.15 Saga Steps
+
+| ID | Requirement |
+|----|-------------|
+| OPS-220 | Each step **MUST** implement an interface providing `name()`, `execute(Order)` and `compensate(Order)`. |
+| OPS-221 | Each step **MUST** simulate 10 ms of work via `Thread.sleep`. *(V3.0.0 in-process simulation; V3.1.0+ replaces this with real external calls.)* |
+| OPS-222 | Each step **MUST** read its failure rate from a per-step env var (`PAYMENT_FAILURE_RATE`, `INVENTORY_FAILURE_RATE`, `SHIPPING_FAILURE_RATE`; default 0.0). When the configured rate triggers, `execute()` **MUST** throw `StepFailedException`. |
+| OPS-223 | Compensations **MAY** assume their work succeeds in V3.0.0. Compensation failure handling (with retry, alerting, manual intervention) is V3.1.0+ territory. |
+| OPS-224 | Steps **MAY** rely on the orchestrator's state-aware re-entry for idempotency in V3.0.0; a completed step is never re-executed because its state transition was committed before the orchestrator yielded. *(V3.1.0+ when steps become real external calls, each step **MUST** carry its own idempotency key — typically `orderId + step.name()`.)* |
 
 ### 3.12 Notification-Side Idempotency
 
@@ -358,7 +390,11 @@ multiple aggregates, etc.) is V3 territory.
   mode (e.g., transient downstream HTTP call) makes the case for it.
 - **Prometheus metrics** *(v2.x or Build 5)*.
 - **Outbox-relay leader election.** An alternative to `SKIP LOCKED` where one instance "owns" outbox publishing. Rejected because `SKIP LOCKED` is stateless and scales horizontally without coordination. Documented here for completeness.
-- Saga pattern with compensating actions (payment → inventory → ship) — V3.
+- **Choreography sagas, asynchronous orchestration.** V3.0.0 uses sync orchestration with in-process steps. Each can evolve independently — async orchestrator (request/response over Kafka) → V3.x; full choreography → not planned (orchestration was the deliberate Q27 choice).
+- **Separate payment / inventory / shipping services.** V3.0.0 keeps steps in-process to focus on state-machine + compensation correctness. Service split → V3.1.0+.
+- **Per-step bounded retries.** Any step failure → immediate compensation in V3.0.0. Retries pre-compensation are the v2.4.0-deferred work that becomes meaningful again now that retryable calls exist; expected V3.1.0.
+- **`OrderFailed` event topic.** Failed sagas don't notify customers in V3.0.0; the `sagas` table is the audit trail. A failure-notification topic is V3.1.0 if a customer-facing failure path lands.
+- **Compensation-failure handling.** Compensations are assumed to succeed. Real systems need retry + alerting + manual escalation — V3.1.0+ once the V3.0.0 happy/sad paths are stable.
 - Distributed tracing (Build 5).
 - Schema registry, Avro/Protobuf (plain JSON only).
 - Authentication, TLS, ACLs.
@@ -380,9 +416,15 @@ implement it.
 | F5 | Consumer lag under burst load | 50 ms work × single thread → linear lag growth | Virtual-thread parallel batch processing in fulfillment-service; bounded concurrency via semaphore; per-batch `commitSync`; async outbox publish | OPS-36, OPS-37, OPS-38, OPS-117, OPS-118 |
 | F6 | Multi-instance outbox-poll race | Two relay instances poll the same `WHERE published_at IS NULL` rows | `SELECT FOR UPDATE SKIP LOCKED` inside an explicit DB transaction; lock held across the entire publish + mark-published cycle | OPS-112, OPS-119 |
 | F7 | Relay-crash duplicate-publish window | Outbox relay JVM crashes between successful Kafka publish and the `markPublishedBatch` UPDATE; on restart the row is republished and `notification-service` (with no idempotency in v2.0.0–v2.2.0) logs the customer twice | `processed_notifications` table; atomic `INSERT … ON CONFLICT DO NOTHING` gate before logging | OPS-52, OPS-130, OPS-131, OPS-133 |
+| F8 | First saga step (payment) fails | No prior steps to compensate; saga transitions directly to `FAILED`; `processed_orders` inserted (idempotency); no outbox row | Saga state machine + `failure_step`/`failure_reason` audit | OPS-200, OPS-201, OPS-211 |
+| F9 | Inventory step fails after payment success | Compensate payment in reverse order; saga `FAILED`; no outbox row | OPS-202 reverse-order compensation | OPS-202 |
+| F10 | Shipping step fails after payment + inventory success | Compensate inventory then payment in reverse; saga `FAILED`; no outbox row | OPS-202 reverse-order compensation | OPS-202 |
+| F11 | Consumer crashes mid-saga | On redelivery the orchestrator reads the persisted state and continues from the next pending step; completed steps are not re-executed | Saga resume-from-state via OPS-203; state-aware re-entry | OPS-203, OPS-213 |
 
 F6 was new in v2.2.0 — it surfaces only with multiple fulfillment-service
 instances. F7 was a known v2.0.0–v2.2.0 limitation and is closed in v2.3.0.
+F8–F11 are new in V3.0.0 — they only exist once fulfillment becomes a
+multi-step state machine.
 
 F6 is **new in v2.2.0** — it didn't exist in V1 (no outbox), or in v2.0.0 / v2.1.0
 (single-instance). It surfaces only when fulfillment-service runs in multiple
@@ -401,6 +443,10 @@ fix; F5 assertion stays as-is and is the v2.1.0 entry point.
 | F5 | `F5_ConsumerLagTest` | `assertTrue(lag > 200)` | flipped in v2.1.0: `assertTrue(lag < 50)` |
 | F6 | `F6_MultiInstanceOutboxRaceTest` | (new in v2.2.0) | `assertEquals(N, events.size())` with two concurrent relay instances |
 | F7 | `F7_NotificationDedupTest` | (new in v2.3.0) | publish a duplicate `OrderFulfilled` directly to `order-events`; assert exactly one notification logged |
+| F8 | `F8_PaymentFailureNoCompensationTest` | (new in V3.0.0) | force payment-step failure; assert saga `FAILED`, no outbox row |
+| F9 | `F9_InventoryFailureCompensatesPaymentTest` | (new in V3.0.0) | force inventory-step failure; assert payment compensated, saga `FAILED` |
+| F10 | `F10_ShippingFailureCompensatesAllTest` | (new in V3.0.0) | force shipping-step failure; assert inventory + payment compensated in reverse |
+| F11 | `F11_SagaResumeAfterCrashTest` | (new in V3.0.0) | invoke orchestrator twice; on second invocation it picks up at the next pending step without re-executing completed ones |
 
 ---
 
@@ -436,6 +482,11 @@ V1 entries Q1–Q7 are unchanged; V2 adds Q8–Q14.
 | Q24 | Notification dedup: DB-backed `processed_notifications`, Kafka-header dedup key, or in-memory cache? | **DB-backed.** Matches the `processed_orders` pattern that fulfillment-service already uses. In-memory caches are lost on restart (the consumer would reprocess from `auto.offset.reset=earliest` on a clean group). Kafka-header dedup requires a stateful processor (Kafka Streams or KTable) that's heavier than what V2 needs. |
 | Q25 | Should `notification-service` share the same Postgres database as the other services? | **Yes.** Single shared DB is intentional in this system — it avoids cross-database transaction concerns (we don't have any) and keeps Flyway migration ownership simple. A microservices-style "every service owns its database" topology is V3 architectural work. |
 | Q26 | Retry-before-DLQ scope for v2.3.0? | **Deferred to v2.4.0+.** Parse failures (the only DLQ trigger today) are deterministic; retrying the same bytes won't change the outcome. Transient errors are already absorbed by Kafka redelivery + idempotency. Will revisit when there's a concrete transient-error path (e.g., an external HTTP call from a future processing step). |
+| Q27 | Orchestration or choreography? | **Orchestration.** Single state machine owned by `fulfillment-service` is easier to reason about, debug, and extend than emergent flow from event subscriptions. Choreography is not planned. |
+| Q28 | In-process steps or separate services? | **In-process for V3.0.0.** The architectural concern is the saga's state-machine + compensation correctness, not network plumbing. Steps extract to services in V3.1.0+ when the abstraction is stable. |
+| Q29 | Synchronous or asynchronous orchestrator? | **Synchronous.** Each step is a method call returning a result. The whole saga lives within one consumer invocation. Async orchestration (request/response over Kafka per step) is V3.x. |
+| Q30 | Per-step retries before triggering compensation? | **None in V3.0.0.** Any step failure → compensate. v2.4.0-deferred retry-before-DLQ work becomes meaningful again now that retryable calls exist; layer it on the saga steps in V3.1.0. |
+| Q31 | Emit `OrderFailed` events on failed sagas? | **No in V3.0.0.** The `sagas` table is the audit truth; failure observability lives in Postgres. A customer-facing failure-notification topic lands when there's a real failure-recovery path (V3.1.0+). |
 
 ---
 
@@ -456,3 +507,4 @@ V1 entries Q1–Q7 are unchanged; V2 adds Q8–Q14.
 | 0.3 | 2026-04-28 | Steve Weiland | v2.1.0: virtual-thread parallel batch processing in fulfillment-service (F5 fix); per-batch `commitSync`; bounded concurrency via `--worker-pool-size` semaphore; async outbox relay publish + batched `markPublished`. New OPS-36, OPS-37, OPS-38, OPS-117, OPS-118; resolved Q15-Q19. |
 | 0.4 | 2026-04-29 | Steve Weiland | v2.2.0: multi-instance fulfillment via `SELECT FOR UPDATE SKIP LOCKED` on outbox poll, with the lock held across publish + mark-published in a single DB transaction. New F6 failure mode and chaos test; OPS-112 updated, OPS-115 relaxed to allow concurrent relays, OPS-119 added, OPS-76 added (two-instance docker-compose). Resolved Q20-Q23. |
 | 0.5 | 2026-04-29 | Steve Weiland | v2.3.0: notification-side idempotency closes the relay-crash duplicate-publish window. New `processed_notifications` table; OPS-52, OPS-53 flipped from "MUST NOT" to "MUST"; new §3.12 with OPS-130–OPS-133. F7 added to §6 / chaos suite. Retry-before-DLQ deferred to v2.4.0+ (Q26). Resolved Q24-Q26. |
+| 0.6 | 2026-04-29 | Steve Weiland | V3.0.0: saga pattern (orchestrated, in-process, synchronous) with payment → inventory → shipping. New §3.13 (orchestrator), §3.14 (state), §3.15 (steps); OPS-33 rewritten to delegate to the orchestrator; OPS-35 retired (replaced by per-step `Thread.sleep(10)` in OPS-221). F8–F11 added to §6 / chaos suite. Resolved Q27-Q31. |

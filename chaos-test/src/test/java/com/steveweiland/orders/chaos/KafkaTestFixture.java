@@ -73,7 +73,7 @@ public abstract class KafkaTestFixture {
         // Per-test isolation for DB state. Tests use unique orderIds anyway, but
         // truncating keeps row counts predictable for diagnostics.
         try (Connection c = DS.getConnection(); Statement s = c.createStatement()) {
-            s.execute("TRUNCATE processed_orders, outbox, idempotency_keys, processed_notifications");
+            s.execute("TRUNCATE processed_orders, outbox, idempotency_keys, processed_notifications, sagas");
         } catch (Exception e) {
             throw new RuntimeException("DB cleanup failed", e);
         }

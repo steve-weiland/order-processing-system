@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.steveweiland.orders.common.JsonMapper;
 import com.steveweiland.orders.common.Order;
 import com.steveweiland.orders.common.OrderFulfilled;
+import com.steveweiland.orders.fulfillment.saga.SagaOrchestrator;
+import com.steveweiland.orders.fulfillment.saga.SagaResult;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
@@ -46,6 +48,7 @@ public final class FulfillmentConsumer implements Runnable, AutoCloseable {
     private final ProcessedOrdersStore processedStore;
     private final OutboxStore outboxStore;
     private final DlqProducer dlq;
+    private final SagaOrchestrator orchestrator;
     private final String topic;
     private final String eventsTopic;
     private final ExecutorService workers;
@@ -57,9 +60,11 @@ public final class FulfillmentConsumer implements Runnable, AutoCloseable {
                                DataSource ds,
                                ProcessedOrdersStore processedStore,
                                OutboxStore outboxStore,
-                               DlqProducer dlq) {
+                               DlqProducer dlq,
+                               SagaOrchestrator orchestrator) {
         this(bootstrapServers, DEFAULT_TOPIC, DEFAULT_EVENTS_TOPIC, DEFAULT_GROUP_ID,
-                DEFAULT_WORKER_POOL_SIZE, Map.of(), ds, processedStore, outboxStore, dlq);
+                DEFAULT_WORKER_POOL_SIZE, Map.of(),
+                ds, processedStore, outboxStore, dlq, orchestrator);
     }
 
     public FulfillmentConsumer(String bootstrapServers,
@@ -71,7 +76,8 @@ public final class FulfillmentConsumer implements Runnable, AutoCloseable {
                                DataSource ds,
                                ProcessedOrdersStore processedStore,
                                OutboxStore outboxStore,
-                               DlqProducer dlq) {
+                               DlqProducer dlq,
+                               SagaOrchestrator orchestrator) {
         Properties props = new Properties();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
@@ -88,6 +94,7 @@ public final class FulfillmentConsumer implements Runnable, AutoCloseable {
         this.processedStore = processedStore;
         this.outboxStore = outboxStore;
         this.dlq = dlq;
+        this.orchestrator = orchestrator;
         this.workers = Executors.newVirtualThreadPerTaskExecutor();
         this.concurrency = new Semaphore(Math.max(1, workerPoolSize));
     }
@@ -115,12 +122,6 @@ public final class FulfillmentConsumer implements Runnable, AutoCloseable {
         }
     }
 
-    /**
-     * Dispatch every record in the batch onto the virtual-thread executor and
-     * wait for all of them. Commit per-batch only if every record succeeded;
-     * otherwise leave offsets uncommitted and rely on at-least-once redelivery
-     * + processed_orders idempotency to converge on the next poll.
-     */
     private void processBatch(ConsumerRecords<String, byte[]> batch) {
         Map<TopicPartition, Long> maxOffset = new ConcurrentHashMap<>();
         List<Future<?>> tasks = new ArrayList<>();
@@ -176,10 +177,10 @@ public final class FulfillmentConsumer implements Runnable, AutoCloseable {
 
         MDC.put("orderId", order.orderId());
         try {
-            log.info("fulfilling customerId={} partition={} offset={}",
+            log.info("starting saga customerId={} partition={} offset={}",
                     order.customerId(), rec.partition(), rec.offset());
 
-            Thread.sleep(50);
+            SagaResult result = orchestrator.run(order);
 
             try (Connection c = ds.getConnection()) {
                 c.setAutoCommit(false);
@@ -187,28 +188,29 @@ public final class FulfillmentConsumer implements Runnable, AutoCloseable {
                     Instant fulfilledAt = Instant.now();
                     boolean claimed = processedStore.insert(c, order.orderId(), order.customerId(), fulfilledAt);
                     if (!claimed) {
-                        // Another worker (or a previous redelivery) already fulfilled this orderId.
-                        // The atomic INSERT … ON CONFLICT DO NOTHING is the idempotency check —
-                        // we don't insert an outbox row, and the caller will commit the Kafka offset.
                         c.commit();
-                        log.info("idempotent skip — already fulfilled");
+                        log.info("idempotent skip — already processed");
                         return;
                     }
 
-                    OrderFulfilled event = new OrderFulfilled(order.orderId(), order.customerId(), fulfilledAt);
-                    byte[] payload = mapper.writeValueAsBytes(event);
-                    outboxStore.insert(c, order.orderId(), eventsTopic, order.orderId(), payload);
+                    if (result.isCompleted()) {
+                        OrderFulfilled event = new OrderFulfilled(order.orderId(), order.customerId(), fulfilledAt);
+                        byte[] payload = mapper.writeValueAsBytes(event);
+                        outboxStore.insert(c, order.orderId(), eventsTopic, order.orderId(), payload);
+                    }
 
                     c.commit();
-                    log.info("fulfilled — outbox row enqueued");
+                    if (result.isCompleted()) {
+                        log.info("saga completed — outbox row enqueued");
+                    } else {
+                        log.info("saga failed step={} reason={} — no outbox row",
+                                result.failureStep(), result.failureReason());
+                    }
                 } catch (Exception inner) {
                     c.rollback();
                     throw inner;
                 }
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            log.warn("interrupted while fulfilling");
         } catch (Exception e) {
             log.error("fulfillment DB transaction failed; offset will not be committed", e);
             throw new RuntimeException(e);

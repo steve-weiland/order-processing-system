@@ -558,17 +558,115 @@ $ docker exec ops-postgres psql -U orders -d orders -t -c \
 
 ---
 
+## F8 — Payment step fails
+
+V3.0.0 introduces the saga state machine. Payment is the first step; if it
+fails, no prior steps need compensation, the saga goes directly to `FAILED`,
+and `processed_orders` is inserted for idempotency but no outbox row is
+written.
+
+`F8_PaymentFailureNoCompensationTest` runs in ~0.1 s — pure orchestrator + DB,
+no Kafka.
+
+```
+sagaState                 = FAILED
+failure_step              = payment
+payment.executionCount    = 1
+payment.compensationCount = 0    ← no compensation needed
+inventory.executionCount  = 0    ← never reached
+```
+
+## F9 — Inventory fails after payment
+
+Compensation runs in reverse order: `payment.compensate()` refunds before
+the saga transitions to `FAILED`.
+
+```
+sagaState                  = FAILED
+failure_step               = inventory
+payment.executionCount     = 1
+payment.compensationCount  = 1   ← refunded
+inventory.executionCount   = 1   ← attempted
+inventory.compensationCount = 0
+shipping.executionCount    = 0   ← never reached
+```
+
+## F10 — Shipping fails after payment + inventory
+
+Both prior steps compensated, in reverse order (inventory first, then payment).
+
+```
+shipping.compensationCount  = 0   ← shipping never succeeded
+inventory.compensationCount = 1   ← released first
+payment.compensationCount   = 1   ← refunded last
+```
+
+## F11 — Consumer crashes mid-saga
+
+The contract under test is **state-aware re-entry**: every state transition
+is persisted before the next step runs, so on redelivery the orchestrator
+resumes at the next pending step without re-executing completed work.
+
+The test wraps `InventoryStep` with one that throws `RuntimeException` on
+first call (simulating a JVM crash). After the first run propagates the
+exception out, the saga row sits at `INVENTORY_PENDING` (the
+`PAYMENT_PENDING → INVENTORY_PENDING` transition was already committed). A
+second `SagaOrchestrator` instance over the same `SagaStore` runs against
+the same in-memory step state — it finds the existing saga row, skips the
+payment block, runs inventory + shipping, reaches `COMPLETED`.
+
+```
+After two invocations:
+  payment.executionCount    = 1   ← NOT re-executed on resume
+  inventory.executionCount  = 1   ← ran on resume only
+  shipping.executionCount   = 1   ← ran on resume only
+  payment.compensationCount = 0   ← saga succeeded; no compensation
+```
+
+## Manual run — failed-saga path end-to-end
+
+```
+$ docker compose up -d --build
+$ docker compose stop fulfillment-service-2
+$ docker compose run -d --rm \
+    -e INVENTORY_FAILURE_RATE=1.0 \
+    --name ops-fulfillment-failing fulfillment-service-1
+$ for i in 1 2; do curl -s -X POST localhost:6080/orders … ; done
+
+$ docker exec ops-postgres psql -U orders -d orders -c \
+    "SELECT order_id, state, failure_step, failure_reason FROM sagas WHERE state='FAILED';"
+              order_id                | state  | failure_step |          failure_reason
+--------------------------------------+--------+--------------+----------------------------------
+ 221f60d2-006b-419b-9d6d-903bf5a7f6fc | FAILED | inventory    | inventory unavailable (simulated)
+ 4949ddc7-a1ee-433f-a098-8ad253a3b0ef | FAILED | inventory    | inventory unavailable (simulated)
+
+$ docker logs ops-fulfillment-failing | grep 'payment refunded'
+…  payment refunded   orderId=221f60d2-…
+…  payment refunded   orderId=4949ddc7-…
+
+$ docker exec ops-kafka /opt/kafka/bin/kafka-get-offsets.sh \
+    --bootstrap-server localhost:9092 --topic order-events \
+    | awk -F: '{sum+=$3} END {print sum}'
+3   ← unchanged from happy-path baseline; failed sagas emit no event
+```
+
+---
+
 ## Summary table
 
-| # | V1 result | Latest V2.x result | Mechanism | Test |
-|---|-----------|-------------------|-----------|------|
-| F1 | 2 events | 1 event | `processed_orders` + `Idempotency-Key` | `F1_DuplicateOrdersTest` |
-| F2 | 2 events | 1 event | `commitSync` after DB tx + idempotency | `F2_DuplicateNotificationsTest` |
-| F3 | 0 events (lost) | 1 event | DB tx is the durability gate | `F3_LostOrdersTest` |
-| F4 | consumer crashed, partition stalled | consumer survived, DLQ has 1, valid event = 1 | `byte[]` deserialize + DLQ routing (v2.0.0) | `F4_PoisonMessageTest` |
-| F5 | lag 500 / 2s | lag 0 / 2s | virtual-thread parallel batch + async outbox publish (v2.1.0) | `F5_ConsumerLagTest` |
-| F6 | (didn't exist single-instance) | exactly N events for N orders with 2 relays | `SELECT FOR UPDATE SKIP LOCKED` (v2.2.0) | `F6_MultiInstanceOutboxRaceTest` |
-| F7 | (documented v2.0.0–v2.2.0 limitation) | 1 notification per orderId | `processed_notifications` (v2.3.0) | `F7_NotificationDedupTest` |
+| # | Result | Mechanism | Test |
+|---|--------|-----------|------|
+| F1 | 1 event for duplicate sends | `processed_orders` + `Idempotency-Key` (v2.0.0) | `F1_DuplicateOrdersTest` |
+| F2 | 1 event after redelivery | `commitSync` after DB tx + idempotency (v2.0.0) | `F2_DuplicateNotificationsTest` |
+| F3 | record never lost | DB tx is the durability gate (v2.0.0) | `F3_LostOrdersTest` |
+| F4 | poison → DLQ + consumer survives | `byte[]` deserialize + DLQ routing (v2.0.0) | `F4_PoisonMessageTest` |
+| F5 | lag 500 → 0 / 2s window | virtual-thread parallel batch + async outbox (v2.1.0) | `F5_ConsumerLagTest` |
+| F6 | exactly N events for N orders, 2 relays | `SELECT FOR UPDATE SKIP LOCKED` (v2.2.0) | `F6_MultiInstanceOutboxRaceTest` |
+| F7 | 1 notification per orderId | `processed_notifications` (v2.3.0) | `F7_NotificationDedupTest` |
+| F8 | saga `FAILED`, no compensation | saga state machine (v3.0.0) | `F8_PaymentFailureNoCompensationTest` |
+| F9 | inventory failure → payment refunded | reverse-order compensation (v3.0.0) | `F9_InventoryFailureCompensatesPaymentTest` |
+| F10 | shipping failure → both prior compensated | reverse-order compensation (v3.0.0) | `F10_ShippingFailureCompensatesAllTest` |
+| F11 | mid-saga crash → resume at next step | state-aware re-entry (v3.0.0) | `F11_SagaResumeAfterCrashTest` |
 
 V2 chaos suite total runtime: **~25 s** (Testcontainers spin-up + 5 tests).
 

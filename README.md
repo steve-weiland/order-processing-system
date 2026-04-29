@@ -4,21 +4,21 @@ Event-driven order pipeline on **Java 21 + Apache Kafka + Postgres**, built to
 demonstrate the V1 → V2 transition that turns a naive at-most-once pipeline
 into one with **effectively-once** delivery semantics.
 
-V1 was deliberately broken in five well-known ways. v2.0.0 fixed four of them
-(F1–F4) with three mechanisms: an **idempotency key table**, a **transactional
-outbox**, and a **dead letter queue**. v2.1.0 closed F5 (consumer lag) with
-**virtual-thread parallel batch processing** + **async outbox publish**. v2.2.0
-adds **multi-instance fulfillment** — two `fulfillment-service` JVMs share
-the broker + Postgres without duplicate publishes, coordinated by
-`SELECT FOR UPDATE SKIP LOCKED` on the outbox poll. Each fix is locked in by
-a deterministic chaos test (F1–F6) whose assertion was inverted across the
-V1 → V2.x commit boundary — that diff is the portfolio artifact.
+V1 was deliberately broken in five well-known ways. The V2.x line walked the
+correctness → throughput → multi-instance → hardening arc one minor version
+at a time. **V3.0.0 is the architectural shift** — fulfillment becomes a
+**saga state machine** (payment → inventory → ship) with compensating
+actions on failure. Each step persists state to Postgres so the orchestrator
+is resumable across crashes. The V2.x correctness machinery (idempotency,
+outbox, DLQ, multi-instance via `SKIP LOCKED`, notification dedup) carries
+over unchanged; the saga sits *above* it. 11 deterministic chaos tests
+(F1-F11) cover every documented failure mode.
 
 | | |
 |--|--|
 | **Spec** | [`spec.md`](./spec.md) — RFC-2119 requirements, V1/V2 mapping |
 | **Chaos report** | [`docs/chaos-report.md`](./docs/chaos-report.md) — V1 baseline → V2 fix per failure |
-| **Status** | `v2.3.0` released — notification-side idempotency closes the relay-crash duplicate-publish window. All 7 documented failure modes (F1-F7) green in the chaos suite. |
+| **Status** | `v3.0.0` released — saga pattern (payment → inventory → ship) with compensating actions. All 11 documented failure modes (F1-F11) green in the chaos suite. |
 
 ---
 
@@ -68,18 +68,26 @@ The V1 → V2 story, with the failing chaos test that drove each fix.
 | F5 | Single-thread × 50 ms / record → lag grew linearly under burst. | **v2.1.0**: `poll()` batches dispatched onto a virtual-thread executor; per-batch `commitSync`; bounded by `--worker-pool-size` semaphore (default 32); outbox relay moved to async batch publish. | `F5_ConsumerLagTest` — flipped from `assertTrue(lag > 200)` to `assertTrue(lag < 50)`; measured lag = 0 in 2 s window. |
 | F6 | (new in v2.2.0 — didn't exist when fulfillment ran in a single JVM) Two relay instances poll the same `WHERE published_at IS NULL` rows → every event published twice. | **v2.2.0**: `SELECT FOR UPDATE SKIP LOCKED` inside an explicit DB tx; the lock is held across the Kafka publish and the `markPublishedBatch` UPDATE so a second instance cannot lock-and-publish the same row. | `F6_MultiInstanceOutboxRaceTest` — spawns two `V2Stack`s sharing broker + Postgres; asserts exactly N events for N orders. |
 | F7 | Outbox-relay JVM crashes between successful Kafka publish and `markPublishedBatch` → on restart the row is republished. The idempotent producer dedupes within a session, not across crashes. Pre-v2.3.0 `notification-service` had no idempotency, so customers got two notifications. | **v2.3.0**: `processed_notifications` table; atomic `INSERT ... ON CONFLICT DO NOTHING` before the log emit. Duplicate deliveries lose the conflict and are silently suppressed (`duplicate notification suppressed` log line). | `F7_NotificationDedupTest` — publishes two identical `OrderFulfilled` records to `order-events`; asserts exactly one notification fires. |
+| F8 | (new in v3.0.0 — only exists once fulfillment is multi-step) Payment step fails — the first step of the saga. | **v3.0.0**: saga transitions directly to `FAILED` with `failure_step=payment`; nothing to compensate. `processed_orders` row inserted (idempotency); no outbox row, no notification. | `F8_PaymentFailureNoCompensationTest` |
+| F9 | Inventory fails after payment success. Without compensation, the customer would be charged but never receive their order. | **v3.0.0**: orchestrator walks completed steps in reverse — `payment.compensate()` refunds the charge before saga reaches `FAILED`. | `F9_InventoryFailureCompensatesPaymentTest` |
+| F10 | Shipping fails after payment + inventory success. | **v3.0.0**: compensations run in reverse order: `inventory.compensate()` releases reserved stock, then `payment.compensate()` refunds. | `F10_ShippingFailureCompensatesAllTest` |
+| F11 | Consumer crashes mid-saga (between two completed steps and the next one). | **v3.0.0**: state-aware re-entry — every transition is committed to Postgres before the next step runs, so on redelivery the orchestrator picks up at the next pending step without re-executing completed work. | `F11_SagaResumeAfterCrashTest` |
 
 Run the suite and watch the numbers come out:
 
 ```bash
 $ make chaos
 [INFO] Tests run: 1, in F1_DuplicateOrdersTest                Time: 4.7s   PASS
-[INFO] Tests run: 1, in F2_DuplicateNotificationsTest         Time: 9.0s   PASS
-[INFO] Tests run: 1, in F3_LostOrdersTest                     Time: 2.6s   PASS
-[INFO] Tests run: 1, in F4_PoisonMessageTest                  Time: 3.8s   PASS
-[INFO] Tests run: 1, in F5_ConsumerLagTest                    Time: 3.1s   PASS
+[INFO] Tests run: 1, in F2_DuplicateNotificationsTest         Time: 5.6s   PASS
+[INFO] Tests run: 1, in F3_LostOrdersTest                     Time: 2.7s   PASS
+[INFO] Tests run: 1, in F4_PoisonMessageTest                  Time: 3.7s   PASS
+[INFO] Tests run: 1, in F5_ConsumerLagTest                    Time: 2.7s   PASS
 [INFO] Tests run: 1, in F6_MultiInstanceOutboxRaceTest        Time: 5.8s   PASS
-[INFO] Tests run: 1, in F7_NotificationDedupTest              Time: 3.2s   PASS
+[INFO] Tests run: 1, in F7_NotificationDedupTest              Time: 3.1s   PASS
+[INFO] Tests run: 1, in F8_PaymentFailureNoCompensationTest   Time: 0.1s   PASS
+[INFO] Tests run: 1, in F9_InventoryFailureCompensatesPay…    Time: 3.7s   PASS
+[INFO] Tests run: 1, in F10_ShippingFailureCompensatesAllT…   Time: 0.1s   PASS
+[INFO] Tests run: 1, in F11_SagaResumeAfterCrashTest          Time: 0.1s   PASS
 
 === chaos-test/target/lag-v2.1.txt ===
 burst=500 window=2s lag=0
@@ -160,6 +168,21 @@ rejected in Q9. The pragmatic fix is **idempotent consumers** —
 with the same atomic INSERT-ON-CONFLICT pattern that `fulfillment-service`
 uses for `processed_orders`. The duplicate, when it arrives, loses the
 conflict and is silently suppressed.
+
+**Saga as a persisted state machine, not a transaction.** V3.0.0
+introduces the saga pattern. Three steps (payment → inventory → ship)
+each can fail; failures must compensate already-completed steps in
+reverse order. The orchestrator commits every state transition to
+Postgres *before* invoking the next step, which buys two important
+properties: (1) on JVM crash + redelivery, the orchestrator reads the
+saga's persisted state and picks up at the next pending step without
+re-executing completed ones (F11); (2) compensations are anchored in
+durable state, not in-memory bookkeeping. The trade-off is performance —
+each step adds a DB round-trip — and the assumption that compensations
+themselves succeed (compensation-failure handling is V3.1.0+ work).
+Real distributed sagas (separate services per step communicating over
+Kafka request/response) are a layer that fits cleanly on top of this
+state machine — V3.1.0+ when steps need to become real external calls.
 
 ---
 
@@ -296,7 +319,8 @@ order-processing-system/
 | `v2.1.0` ✅ | Throughput | F5 fixed — virtual-thread parallel batch + async outbox publish; lag 469 → 0 |
 | `v2.2.0` ✅ | Multi-instance | F6 fixed — `SELECT FOR UPDATE SKIP LOCKED` lets two fulfillment-service JVMs share the same outbox without duplicate publishes |
 | `v2.3.0` ✅ | Hardening | F7 fixed — `processed_notifications` table closes the relay-crash duplicate-publish window |
-| `v2.4.0` | Hardening | Retry-before-DLQ — deferred from v2.3.0 (currently no concrete failure mode it would mitigate; revisit when transient downstream calls land) |
+| `v3.0.0` ✅ | Architectural shift | Saga pattern (payment → inventory → ship) with compensating actions; F8-F11 chaos coverage |
+| `v3.1.0` | Saga hardening | Per-step retries with backoff (the v2.4.0-deferred work, now meaningful); split steps into separate services; `OrderFailed` event topic; compensation-failure handling |
 | V3 | Architectural shift | Saga pattern (payment → inventory → ship); schema registry + Avro/Protobuf |
 
 ---
