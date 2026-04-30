@@ -1,9 +1,14 @@
-# Chaos Report — V1 → V2
+# Chaos Report — V1 → V3
 
 > Companion to [README.md](../README.md) and [spec.md](../spec.md).
-> What follows is the V1 → V2 transition recorded as five failure modes
-> (F1–F5), each with the test that locked the V1 bug in place and the V2 fix
-> that inverted it.
+> What follows is the V1 → V3 evolution recorded as eleven failure modes
+> (F1–F11). F1–F5 were V1 baselines; v2.0.0–v2.3.0 closed each one (F1–F4
+> via correctness mechanisms, F5 via parallel batch processing). F6 surfaced
+> at v2.2.0 (multi-instance) and was closed in the same release. F7 was a
+> v2.0.0–v2.2.0 known limitation closed at v2.3.0. F8–F11 are saga-specific
+> failure modes that V3.0.0 introduced and closed in the same release. Each
+> mode has a chaos test that locked in the broken behavior at the version
+> boundary and inverted to assert the fix.
 
 The premise of this build follows the [study plan](../../system-design-study-plan.md)
 philosophy: *you understand a system when you have operated a buggy version of
@@ -668,7 +673,7 @@ $ docker exec ops-kafka /opt/kafka/bin/kafka-get-offsets.sh \
 | F10 | shipping failure → both prior compensated | reverse-order compensation (v3.0.0) | `F10_ShippingFailureCompensatesAllTest` |
 | F11 | mid-saga crash → resume at next step | state-aware re-entry (v3.0.0) | `F11_SagaResumeAfterCrashTest` |
 
-V2 chaos suite total runtime: **~25 s** (Testcontainers spin-up + 5 tests).
+V3 chaos suite total runtime: **~30 s** (Testcontainers spin-up + 11 tests).
 
 ---
 

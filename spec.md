@@ -11,8 +11,16 @@
 
 ## 1. Overview
 
-V2 fixes the four correctness failures documented in V1 (F1–F4) using three
-mechanisms:
+This spec is layered: each version after V1 added a section. As of v0.6 the
+system spans **V1 (deliberately broken baseline) → v2.0.0 (correctness) →
+v2.1.0 (throughput) → v2.2.0 (multi-instance) → v2.3.0 (notification dedup)
+→ V3.0.0 (saga pattern)**. The roadmap and shipped/open status are tracked
+in [`README.md`](./README.md). The text below preserves the version that
+introduced each requirement so the spec can be read as the V1 → V3 evolution
+in commit order.
+
+v2.0.0 fixed the four correctness failures documented in V1 (F1–F4) using
+three mechanisms:
 
 1. **Idempotency** — a DB-backed `processed_orders` table is consulted before
    any fulfillment work. Duplicate orders (whether produced by HTTP retries or
@@ -401,11 +409,15 @@ multiple aggregates, etc.) is V3 territory.
 
 ---
 
-## 6. V1 Failure Modes Resolved in V2
+## 6. Failure Modes (V1 baseline → V3 final state)
 
-V1 §6 listed five deliberate failure modes (F1–F5). V2 fixes four of them.
-Each row maps the V1 bug to its V2 fix mechanism and the requirements that
-implement it.
+V1 §6 listed five deliberate failure modes (F1–F5). The V2.x line closed
+F1–F5 across four minor versions; V2.x exposed two additional failure modes
+(F6 in v2.2.0 multi-instance, F7 in the v2.0.0–v2.2.0 single-instance
+window) that v2.2.0 / v2.3.0 closed; V3.0.0 introduced the saga pattern,
+which surfaced four new saga-specific failure modes (F8–F11) closed in the
+same release. Each row below maps the V1 bug to its fix mechanism and the
+requirements that implement it.
 
 | # | Failure | V1 behaviour | V2 fix mechanism | Requirements |
 |---|---------|-------------|-----------------|--------------|
@@ -430,11 +442,12 @@ F6 is **new in v2.2.0** — it didn't exist in V1 (no outbox), or in v2.0.0 / v2
 (single-instance). It surfaces only when fulfillment-service runs in multiple
 JVMs against the same Postgres + Kafka.
 
-The chaos test suite at `chaos-test/` retains its V1-baseline assertions for
-all five tests. V2 implementation work flips F1–F4 assertions to require the
-fix; F5 assertion stays as-is and is the v2.1.0 entry point.
+The chaos test suite at `chaos-test/` retains its V1-baseline assertions
+for the five tests that started in V1; v2.0.0 work flipped F1–F4 to assert
+the fix; v2.1.0 flipped F5; v2.2.0 added F6; v2.3.0 added F7; V3.0.0 added
+F8–F11. At HEAD, all 11 chaos tests assert their respective fix.
 
-| # | Test class | V1 assertion | V2 assertion |
+| # | Test class | V1 assertion | Current assertion |
 |---|-----------|-------------|--------------|
 | F1 | `F1_DuplicateOrdersTest` | `assertEquals(2, events.size())` | `assertEquals(1, events.size())` |
 | F2 | `F2_DuplicateNotificationsTest` | `assertEquals(2, events.size())` | `assertEquals(1, events.size())` |
@@ -452,7 +465,8 @@ fix; F5 assertion stays as-is and is the v2.1.0 entry point.
 
 ## 7. Resolved Decisions
 
-V1 entries Q1–Q7 are unchanged; V2 adds Q8–Q14.
+V1 entries Q1–Q7; v2.0.0 adds Q8–Q14; v2.1.0 adds Q15–Q19; v2.2.0 adds
+Q20–Q23; v2.3.0 adds Q24–Q26; V3.0.0 adds Q27–Q31.
 
 | # | Question | Decision |
 |---|----------|----------|
@@ -494,7 +508,7 @@ V1 entries Q1–Q7 are unchanged; V2 adds Q8–Q14.
 
 | # | Question | Owner | Due |
 |---|----------|-------|-----|
-| *(none outstanding for V2)* | | | |
+| *(none outstanding at HEAD)* | | | |
 
 ---
 

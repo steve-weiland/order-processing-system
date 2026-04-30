@@ -1,66 +1,69 @@
 # Order Processing System
 
-Event-driven order pipeline on **Java 21 + Apache Kafka + Postgres**, built to
-demonstrate the V1 → V2 transition that turns a naive at-most-once pipeline
-into one with **effectively-once** delivery semantics.
+Event-driven order pipeline on **Java 21 + Apache Kafka + Postgres**, built
+to walk the V1 → V3 evolution: a deliberately-broken naive pipeline; through
+the V2.x correctness, throughput, multi-instance, and hardening arc one
+minor version at a time; into V3 where fulfillment becomes a **saga state
+machine** (payment → inventory → ship) with compensating actions on failure.
 
-V1 was deliberately broken in five well-known ways. The V2.x line walked the
-correctness → throughput → multi-instance → hardening arc one minor version
-at a time. **V3.0.0 is the architectural shift** — fulfillment becomes a
-**saga state machine** (payment → inventory → ship) with compensating
-actions on failure. Each step persists state to Postgres so the orchestrator
-is resumable across crashes. The V2.x correctness machinery (idempotency,
-outbox, DLQ, multi-instance via `SKIP LOCKED`, notification dedup) carries
-over unchanged; the saga sits *above* it. 11 deterministic chaos tests
-(F1-F11) cover every documented failure mode.
+The V2.x correctness machinery — idempotency, transactional outbox, DLQ,
+multi-instance coordination via `SELECT FOR UPDATE SKIP LOCKED`, notification
+dedup — carries over unchanged in V3; the saga sits *above* it. Each
+mechanism was driven into the codebase by a deterministic chaos test that
+flipped its assertion at the version boundary; the diff on those tests is
+the portfolio artifact. 11 documented failure modes (F1–F11), 11 chaos
+tests, all green at HEAD.
 
 | | |
 |--|--|
-| **Spec** | [`spec.md`](./spec.md) — RFC-2119 requirements, V1/V2 mapping |
-| **Chaos report** | [`docs/chaos-report.md`](./docs/chaos-report.md) — V1 baseline → V2 fix per failure |
-| **Status** | `v3.0.0` released — saga pattern (payment → inventory → ship) with compensating actions. All 11 documented failure modes (F1-F11) green in the chaos suite. |
+| **Spec** | [`spec.md`](./spec.md) — RFC-2119 requirements, V1 → V3 evolution |
+| **Chaos report** | [`docs/chaos-report.md`](./docs/chaos-report.md) — per-failure V1 baseline → fix history |
+| **Status** | `v3.0.0` released. All 11 documented failure modes (F1–F11) green in the chaos suite. |
 
 ---
 
-## Architecture (V2)
+## Architecture (V3)
 
 ```mermaid
 flowchart LR
     client([HTTP client]) -- POST /orders --> api[order-api<br/>Javalin :6080<br/>Idempotency-Key dedup]
     api -- producer --> orders[(orders<br/>Kafka topic)]
     orders -- consume --> ful[fulfillment-service<br/>byte&#91;&#93; deserialize]
-    ful -- parse OK --> idemp{processed_orders<br/>idempotency check}
-    idemp -- new --> tx[[DB tx:<br/>INSERT processed_orders<br/>+ INSERT outbox]]
-    idemp -- seen --> skip[[skip — commit offset]]
-    tx --> commit[commitSync offset]
     ful -- parse FAIL --> dlq[(orders.dlq<br/>+ diagnostic headers)]
-    relay[outbox-relay thread<br/>idempotent producer] -- poll --> outbox[(outbox table)]
+    ful -- parse OK --> saga{{Saga orchestrator<br/>payment ▶ inventory ▶ ship<br/>compensations on failure<br/>state in sagas table}}
+    saga -- COMPLETED --> txOk[[DB tx:<br/>processed_orders<br/>+ outbox row]]
+    saga -- FAILED --> txFail[[DB tx:<br/>processed_orders<br/>only]]
+    txOk --> commit[commitSync offset]
+    txFail --> commit
+    relay[outbox-relay thread<br/>FOR UPDATE SKIP LOCKED] -- poll --> outbox[(outbox table)]
     relay -- publish --> events[(order-events<br/>Kafka topic)]
     relay -- mark published --> outbox
-    events --> notif[notification-service<br/>manual commit]
+    events --> notif[notification-service<br/>processed_notifications dedup]
     notif -- log --> stdout([stdout])
-    api -.- pg[(Postgres<br/>processed_orders<br/>outbox<br/>idempotency_keys)]
+    pg[(Postgres)]
+    api -.- pg
     ful -.- pg
-    tx -.-> outbox
-    pg --- relay
+    relay -.- pg
+    notif -.- pg
 ```
 
 | Service | Stack | Role |
 |---------|-------|------|
 | `order-api` | Java 21, Javalin, kafka-clients, JDBC | HTTP producer on `:6080`; optional `Idempotency-Key` header for HTTP-layer dedup |
-| `fulfillment-service` | Java 21, kafka-clients, Postgres + outbox-relay thread | Idempotent consumer; atomic state + outbox in one DB tx; manual `commitSync` only after tx commits; routes parse failures to DLQ |
-| `notification-service` | Java 21, kafka-clients | Consumer with manual commit; logs notifications |
+| `fulfillment-service` | Java 21, kafka-clients, Postgres + saga orchestrator + outbox-relay thread | Saga drives payment → inventory → ship with compensations; per-batch `commitSync` after DB tx; parse failures → DLQ; outbox relay coordinates across instances via `SKIP LOCKED` |
+| `notification-service` | Java 21, kafka-clients, Postgres | Consumer with manual commit; idempotent log emit via `processed_notifications` |
 | `kafka` | `apache/kafka:3.8.1` KRaft | Single-node broker, 3 partitions per topic, `auto.create.topics.enable=false` |
-| `postgres` | `postgres:16-alpine` | Three Flyway-managed tables: `processed_orders`, `outbox`, `idempotency_keys` |
+| `postgres` | `postgres:16-alpine` | Five Flyway-managed tables: `processed_orders`, `outbox`, `idempotency_keys`, `processed_notifications`, `sagas` |
 
 ---
 
 ## What broke and how it was fixed
 
-The V1 → V2 story, with the failing chaos test that drove each fix.
+The V1 → V3 story, with the failing chaos test that drove each fix and the
+version that landed it.
 
-| # | V1 bug | Mechanism in V2 | Test (inverted V1 → V2) |
-|---|--------|-----------------|------------------------|
+| # | V1 bug (or new failure mode) | Mechanism (version) | Test (inverted at version boundary) |
+|---|------------------------------|--------------------|------------------------------------|
 | F1 | A client retry on `POST /orders` produced **2** records on `orders` and **2** notifications. | `processed_orders` lookup before any work; `Idempotency-Key` header for HTTP-layer dedup. | `F1_DuplicateOrdersTest` — flipped from `assertEquals(2, …)` to `assertEquals(1, …)`. |
 | F2 | A consumer crash before the next auto-commit tick caused **redelivery** → second notification. | `enable.auto.commit=false` + `commitSync` after DB tx; redelivery hits the idempotency check and is skipped. | `F2_DuplicateNotificationsTest` — flipped from 2 → 1. |
 | F3 | Auto-commit advanced the offset before work completed → record **lost** on restart. | DB tx is the durability gate; `commitSync` runs only after `COMMIT` succeeds. | `F3_LostOrdersTest` — flipped from `assertEquals(0, …)` to `assertEquals(1, …)`. |
@@ -112,8 +115,9 @@ Postgres.**
 **In-process relay vs sidecar.** The outbox relay runs as a thread inside the
 fulfillment-service JVM, sharing its connection pool. A separate process would
 be cleaner architecturally but introduces deployment coupling, leader election,
-and an extra failure mode. Kept in-process for V2; revisit if multi-instance
-fulfillment becomes necessary.
+and an extra failure mode. Multi-instance horizontal scaling landed in v2.2.0
+without splitting the relay into a sidecar — `SELECT FOR UPDATE SKIP LOCKED`
+on the outbox poll lets multiple in-process relays coordinate via the DB.
 
 **Two layers of idempotency.** The `Idempotency-Key` header (HTTP layer) and
 `processed_orders` lookup (consumer layer) overlap. Both stay because they
@@ -122,9 +126,12 @@ sees vs Kafka redelivery that the order-api never sees. Removing either
 opens a duplicate window.
 
 **Straight-to-DLQ on first parse failure.** Production-grade systems retry N
-times before giving up. V2 doesn't — a JSON parse failure is structural, not
-transient, and infinite retries would still fail. The retry topic is a
-v2.3.0 hardening pass.
+times before giving up. We don't — a JSON parse failure is structural, not
+transient, and infinite retries would still fail. Retry-before-DLQ was
+originally targeted for v2.3.0, then deferred (no transient-error path in
+the pipeline yet); V3.0.0 sagas introduce real retryable calls, so v3.1.0
+will revisit retry topics layered on the saga steps where it actually buys
+something.
 
 **Fully-parallel batch processing, not per-key serial.** v2.1.0 dispatches
 every record in a `poll()` batch onto a virtual-thread executor with no
@@ -271,8 +278,11 @@ SELECT order_id, customer_id, fulfilled_at FROM processed_orders ORDER BY fulfil
 -- outbox progress (published_at NULL means relay hasn't sent yet)
 SELECT id, topic, published_at IS NOT NULL AS published FROM outbox ORDER BY id;
 
--- idempotency keys (24 h TTL by convention; not auto-reaped in V2)
+-- idempotency keys (24 h TTL by convention; not auto-reaped)
 SELECT key, order_id, created_at FROM idempotency_keys ORDER BY created_at DESC;
+
+-- saga state (V3) — see what step each order reached and what failed
+SELECT order_id, state, failure_step, failure_reason FROM sagas ORDER BY updated_at DESC;
 ```
 
 ---
@@ -282,7 +292,7 @@ SELECT key, order_id, created_at FROM idempotency_keys ORDER BY created_at DESC;
 ```bash
 make build    # mvn compile
 make test     # unit tests only — no broker, ~1s
-make chaos    # Testcontainers + Kafka + Postgres, runs F1-F5, ~25s
+make chaos    # Testcontainers + Kafka + Postgres, runs F1-F11, ~30s
 make package  # shaded jars in each service's target/
 make clean    # mvn clean + docker compose down -v
 ```
@@ -296,32 +306,42 @@ unit-test loop fast.
 
 ```
 order-processing-system/
-├── spec.md                         RFC-2119 spec, V1 → V2 mapping
-├── docs/chaos-report.md            Detailed V1 baseline vs V2 fix per failure mode
-├── docker-compose.yml              kafka + postgres + 3 services
+├── spec.md                         RFC-2119 spec, V1 → V3 evolution
+├── docs/chaos-report.md            Per-failure V1 baseline → fix history
+├── docker-compose.yml              kafka + postgres + 4 service containers
 ├── Makefile
 ├── pom.xml                         parent (Java 21, dep management)
 ├── common/                         shared DTOs, JSON serde, DB helpers, Flyway, TopicAdmin
-│   └── src/main/resources/db/migration/   V{1,2,3}__*.sql
-├── order-api/                      HTTP → Kafka, Idempotency-Key
-├── fulfillment-service/            consumer + outbox relay + DLQ
-├── notification-service/           consumer + log
-└── chaos-test/                     F1-F5 chaos tests (opt-in, profile=chaos)
+│   └── src/main/resources/db/migration/   V1..V5 SQL migrations
+├── order-api/                      HTTP → Kafka, Idempotency-Key store
+├── fulfillment-service/            saga orchestrator + outbox relay + DLQ
+│   └── src/main/java/.../saga/    SagaState, SagaStep, *Step impls, SagaStore, SagaOrchestrator
+├── notification-service/           consumer + log + processed_notifications dedup
+└── chaos-test/                     F1-F11 chaos tests (opt-in, profile=chaos)
 ```
 
 ---
 
 ## Roadmap
 
+Shipped:
+
 | Version | Theme | Scope |
 |---------|-------|-------|
-| `v2.0.0` ✅ | Correctness | F1–F4 fixed via idempotency + outbox + DLQ |
+| `v1.0.0` ✅ | Naive baseline | Three-service pipeline; auto-commit; in-memory state; no idempotency, no DLQ, no outbox. F1–F5 deliberately broken. |
+| `v2.0.0` ✅ | Correctness | F1–F4 fixed: `processed_orders` idempotency, transactional outbox, DLQ for poison, manual `commitSync` after DB tx |
 | `v2.1.0` ✅ | Throughput | F5 fixed — virtual-thread parallel batch + async outbox publish; lag 469 → 0 |
-| `v2.2.0` ✅ | Multi-instance | F6 fixed — `SELECT FOR UPDATE SKIP LOCKED` lets two fulfillment-service JVMs share the same outbox without duplicate publishes |
+| `v2.2.0` ✅ | Multi-instance | F6 fixed — `SELECT FOR UPDATE SKIP LOCKED` lets multiple `fulfillment-service` JVMs share the same outbox without duplicate publishes |
 | `v2.3.0` ✅ | Hardening | F7 fixed — `processed_notifications` table closes the relay-crash duplicate-publish window |
-| `v3.0.0` ✅ | Architectural shift | Saga pattern (payment → inventory → ship) with compensating actions; F8-F11 chaos coverage |
-| `v3.1.0` | Saga hardening | Per-step retries with backoff (the v2.4.0-deferred work, now meaningful); split steps into separate services; `OrderFailed` event topic; compensation-failure handling |
-| V3 | Architectural shift | Saga pattern (payment → inventory → ship); schema registry + Avro/Protobuf |
+| `v3.0.0` ✅ | Architectural shift | Saga pattern (payment → inventory → ship) with compensating actions; F8–F11 chaos coverage |
+
+Open / future:
+
+| Version | Theme | Scope |
+|---------|-------|-------|
+| `v3.1.0` | Saga hardening | Per-step bounded retries with backoff (the v2.4.0-deferred work, now meaningful since saga steps are real retryable calls); compensation-failure handling with retry + alerting; `OrderFailed` event topic for customer-facing failure notifications |
+| `v3.2.0` | Real distributed sagas | Split payment / inventory / shipping into separate services; orchestrator drives them via Kafka request/response; per-step idempotency keys (`orderId + step.name`) |
+| `v3.3.0+` | Choose-your-own | Schema registry + Avro/Protobuf; OpenTelemetry tracing across the saga; Prometheus metrics; saga-state Grafana dashboard |
 
 ---
 
