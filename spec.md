@@ -1,4 +1,4 @@
-# Event-Driven Order Processing System — V2
+# Event-Driven Order Processing System
 
 | Field   | Value              |
 |---------|--------------------|
