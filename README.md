@@ -28,7 +28,7 @@ tests, all green at HEAD.
 flowchart LR
     client([HTTP client]) -- POST /orders --> api[order-api<br/>Javalin :6080<br/>Idempotency-Key dedup]
     api -- producer --> orders[(orders<br/>Kafka topic)]
-    orders -- consume --> ful[fulfillment-service<br/>byte&#91;&#93; deserialize]
+    orders -- consume --> ful["fulfillment-service<br/>byte[] deserialize"]
     ful -- parse FAIL --> dlq[(orders.dlq<br/>+ diagnostic headers)]
     ful -- parse OK --> saga{{Saga orchestrator<br/>payment ▶ inventory ▶ ship<br/>compensations on failure<br/>state in sagas table}}
     saga -- COMPLETED --> txOk[[DB tx:<br/>processed_orders<br/>+ outbox row]]
