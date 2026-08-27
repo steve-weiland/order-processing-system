@@ -21,11 +21,17 @@ run:
 run-kafka:
 	docker compose up -d kafka
 
+run-postgres:
+	docker compose up -d postgres
+
+# Postgres is published on host port 6432 (docker-compose maps 6432:5432 to
+# avoid clashing with a host Postgres), so host-run services need an explicit
+# --jdbc-url; the in-container default targets port 5432.
 run-local: run-kafka run-postgres
-	@echo "Kafka on localhost:9092, Postgres on localhost:5432. In separate terminals:"
-	@echo "  java -jar order-api/target/order-api.jar"
-	@echo "  java -jar fulfillment-service/target/fulfillment-service.jar"
-	@echo "  java -jar notification-service/target/notification-service.jar"
+	@echo "Kafka on localhost:9092, Postgres on localhost:6432. In separate terminals:"
+	@echo "  java -jar order-api/target/order-api.jar          --jdbc-url jdbc:postgresql://localhost:6432/orders"
+	@echo "  java -jar fulfillment-service/target/fulfillment-service.jar --jdbc-url jdbc:postgresql://localhost:6432/orders"
+	@echo "  java -jar notification-service/target/notification-service.jar --jdbc-url jdbc:postgresql://localhost:6432/orders"
 
 logs:
 	docker compose logs -f order-api fulfillment-service-1 fulfillment-service-2 notification-service

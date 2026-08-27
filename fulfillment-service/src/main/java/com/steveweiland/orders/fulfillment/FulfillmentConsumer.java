@@ -251,15 +251,18 @@ public final class FulfillmentConsumer implements Runnable, AutoCloseable {
             try (Connection c = ds.getConnection()) {
                 c.setAutoCommit(false);
                 try {
-                    Instant fulfilledAt = Instant.now();
-                    boolean claimed = processedStore.insert(c, order.orderId(), order.customerId(), fulfilledAt);
+                    boolean completed = result.isCompleted();
+                    Instant fulfilledAt = completed ? Instant.now() : null;
+                    boolean claimed = processedStore.insert(c, order.orderId(), order.customerId(),
+                            completed ? ProcessedOrdersStore.Status.FULFILLED : ProcessedOrdersStore.Status.FAILED,
+                            fulfilledAt);
                     if (!claimed) {
                         c.commit();
                         log.info("idempotent skip — already processed");
                         return;
                     }
 
-                    if (result.isCompleted()) {
+                    if (completed) {
                         OrderFulfilled event = new OrderFulfilled(order.orderId(), order.customerId(), fulfilledAt);
                         byte[] payload = mapper.writeValueAsBytes(event);
                         outboxStore.insert(c, order.orderId(), eventsTopic, order.orderId(), payload);

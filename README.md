@@ -252,9 +252,12 @@ docker compose ps     # fulfillment-service still up
 ```bash
 make run-local        # starts kafka + postgres
 mvn -DskipTests package
-java -jar order-api/target/order-api.jar &
-java -jar fulfillment-service/target/fulfillment-service.jar &
-java -jar notification-service/target/notification-service.jar &
+# Postgres is published on host port 6432 (the compose mapping avoids
+# clashing with a host Postgres), so host-run services need an explicit URL:
+JDBC=jdbc:postgresql://localhost:6432/orders
+java -jar order-api/target/order-api.jar                       --jdbc-url $JDBC &
+java -jar fulfillment-service/target/fulfillment-service.jar   --jdbc-url $JDBC &
+java -jar notification-service/target/notification-service.jar --jdbc-url $JDBC &
 ```
 
 ---

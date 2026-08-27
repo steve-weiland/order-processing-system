@@ -57,6 +57,19 @@ class F3_LostOrdersTest extends KafkaTestFixture {
             assertEquals(1, events.size(),
                     "V2 fix: manual commitSync after DB tx → records never lost");
             assertEquals(order.orderId(), events.get(0).orderId());
+
+            // v3.1.0 row shape: a fulfilled order is recorded as FULFILLED with
+            // a fulfillment time (contrast F8's failed-saga row).
+            try (var c = dataSource().getConnection();
+                 var ps = c.prepareStatement(
+                         "SELECT status, fulfilled_at FROM processed_orders WHERE order_id = ?::uuid")) {
+                ps.setString(1, order.orderId());
+                try (var rs = ps.executeQuery()) {
+                    assertEquals(true, rs.next(), "processed_orders row exists");
+                    assertEquals("FULFILLED", rs.getString(1));
+                    assertEquals(true, rs.getTimestamp(2) != null, "fulfilled_at set on success");
+                }
+            }
         } finally {
             producer.close();
         }

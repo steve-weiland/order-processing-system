@@ -49,6 +49,60 @@ class F8_PaymentFailureNoCompensationTest extends KafkaTestFixture {
         assertFalse(payment.charged(order.orderId()),   "payment never succeeded");
     }
 
+    /**
+     * Full-stack shape of a failed saga (v3.1.0): the consumer still inserts a
+     * processed_orders row (idempotency), but as status=FAILED with NO
+     * fulfilled_at, no outbox row, and no OrderFulfilled event. Pre-V7 the row
+     * said fulfilled_at=now() — the README's "fulfilled orders" query returned
+     * failed orders.
+     */
+    @Test
+    void failedSagaIsRecordedAsFailedNotFulfilled() throws Exception {
+        com.steveweiland.orders.api.OrderProducer producer =
+                new com.steveweiland.orders.api.OrderProducer(bootstrap(), orderTopic);
+        try (V2Stack stack = new V2Stack(bootstrap(), orderTopic, eventTopic, dlqTopic,
+                groupId, java.util.Map.of(), dataSource(), 1.0, 0.0, 0.0)) {   // payment always fails
+            stack.start();
+
+            Order order = sampleOrder();
+            producer.send(order);
+
+            org.awaitility.Awaitility.await()
+                    .atMost(java.time.Duration.ofSeconds(15))
+                    .until(() -> processedRow(order.orderId()) != null);
+
+            ProcessedRow row = processedRow(order.orderId());
+            assertEquals("FAILED", row.status(), "failed saga recorded as FAILED, not FULFILLED");
+            assertEquals(null, row.fulfilledAt(), "a failed order has no fulfillment time");
+            assertEquals(0, countRows("SELECT count(*) FROM outbox"), "no outbox row for a failed saga");
+        } finally {
+            producer.close();
+        }
+    }
+
+    private ProcessedRow processedRow(String orderId) throws Exception {
+        try (var c = dataSource().getConnection();
+             var ps = c.prepareStatement(
+                     "SELECT status, fulfilled_at FROM processed_orders WHERE order_id = ?::uuid")) {
+            ps.setString(1, orderId);
+            try (var rs = ps.executeQuery()) {
+                if (!rs.next()) return null;
+                return new ProcessedRow(rs.getString(1), rs.getTimestamp(2));
+            }
+        }
+    }
+
+    private int countRows(String sql) throws Exception {
+        try (var c = dataSource().getConnection();
+             var ps = c.prepareStatement(sql);
+             var rs = ps.executeQuery()) {
+            rs.next();
+            return rs.getInt(1);
+        }
+    }
+
+    private record ProcessedRow(String status, java.sql.Timestamp fulfilledAt) {}
+
     private static Order sampleOrder() {
         return new Order(
                 UUID.randomUUID().toString(),
