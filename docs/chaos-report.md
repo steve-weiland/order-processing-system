@@ -752,10 +752,22 @@ Three layers, cheapest first:
 ### Evidence
 
 `F13_ConcurrentSagaDoubleExecutionTest`: two latched threads run the same
-order concurrently. Happy path: every step `executionCount == 1` (pre-fix:
-payment 2) and both invocations return `COMPLETED`. Compensation path
-(inventory always fails): charged once, refunded once — not once per
-delivery.
+order concurrently. Happy path: every step `executionCount == 1` and both
+invocations return `COMPLETED`. Compensation path (inventory always
+fails): charged once, refunded once — not once per delivery.
+
+Red baseline, captured by running this test against the pre-fix commit
+(`9830fe8`, F12 in / F13 fix out):
+
+```
+[ERROR] F13_ConcurrentSagaDoubleExecutionTest.concurrentRunsExecuteEachStepExactlyOnce
+org.opentest4j.AssertionFailedError: REGRESSION GUARD: pre-fix code charged
+the customer twice here ==> expected: <1> but was: <2>
+```
+
+The customer was charged twice; F1 stayed green throughout because only
+one of the two runs won the `processed_orders` claim and wrote the outbox
+row — one event, two charges.
 
 ## F14 — Produce failure poisoned an Idempotency-Key
 
