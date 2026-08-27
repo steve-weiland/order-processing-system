@@ -50,6 +50,7 @@ public abstract class KafkaTestFixture {
     protected String orderTopic;
     protected String eventTopic;
     protected String dlqTopic;
+    protected String eventsDlqTopic;
     protected String groupId;
 
     protected static String bootstrap() {
@@ -62,13 +63,15 @@ public abstract class KafkaTestFixture {
         orderTopic = "orders-" + suffix;
         eventTopic = "order-events-" + suffix;
         dlqTopic = "orders-dlq-" + suffix;
+        eventsDlqTopic = "order-events-dlq-" + suffix;
         groupId = "fulfillment-" + suffix;
 
         try (AdminClient admin = adminClient()) {
             admin.createTopics(List.of(
                     new NewTopic(orderTopic, 3, (short) 1),
                     new NewTopic(eventTopic, 3, (short) 1),
-                    new NewTopic(dlqTopic, 3, (short) 1)
+                    new NewTopic(dlqTopic, 3, (short) 1),
+                    new NewTopic(eventsDlqTopic, 3, (short) 1)
             )).all().get(10, TimeUnit.SECONDS);
         }
 
@@ -84,7 +87,7 @@ public abstract class KafkaTestFixture {
     @AfterEach
     final void deleteTopics() {
         try (AdminClient admin = adminClient()) {
-            admin.deleteTopics(List.of(orderTopic, eventTopic, dlqTopic)).all().get(10, TimeUnit.SECONDS);
+            admin.deleteTopics(List.of(orderTopic, eventTopic, dlqTopic, eventsDlqTopic)).all().get(10, TimeUnit.SECONDS);
         } catch (Exception ignored) {}
     }
 

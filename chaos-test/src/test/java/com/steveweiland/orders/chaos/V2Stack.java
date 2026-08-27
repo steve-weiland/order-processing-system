@@ -1,6 +1,6 @@
 package com.steveweiland.orders.chaos;
 
-import com.steveweiland.orders.fulfillment.DlqProducer;
+import com.steveweiland.orders.common.dlq.DlqProducer;
 import com.steveweiland.orders.fulfillment.FulfillmentConsumer;
 import com.steveweiland.orders.fulfillment.OutboxRelay;
 import com.steveweiland.orders.fulfillment.OutboxStore;

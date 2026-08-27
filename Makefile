@@ -1,4 +1,4 @@
-.PHONY: build test chaos package run run-local run-kafka run-postgres logs stop clean order send-order topics psql
+.PHONY: build test chaos package run run-local run-kafka run-postgres logs stop clean order send-order topics psql consume-orders consume-events consume-dlq consume-events-dlq
 
 build:
 	mvn -ntp compile
@@ -57,6 +57,10 @@ consume-events:
 consume-dlq:
 	docker exec -it ops-kafka /opt/kafka/bin/kafka-console-consumer.sh \
 	  --bootstrap-server localhost:9092 --topic orders.dlq --from-beginning --property print.headers=true
+
+consume-events-dlq:
+	docker exec -it ops-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+	  --bootstrap-server localhost:9092 --topic order-events.dlq --from-beginning --property print.headers=true
 
 psql:
 	docker exec -it ops-postgres psql -U orders -d orders

@@ -46,7 +46,8 @@ class F7_NotificationDedupTest extends KafkaTestFixture {
 
         ProcessedNotificationsStore store = new ProcessedNotificationsStore(dataSource());
         NotificationConsumer consumer = new NotificationConsumer(
-                bootstrap(), eventTopic, notifGroup, Map.of(), store);
+                bootstrap(), eventTopic, notifGroup, Map.of(), store,
+                new com.steveweiland.orders.common.dlq.DlqProducer(bootstrap(), eventsDlqTopic));
 
         LinkedBlockingQueue<OrderFulfilled> notified = new LinkedBlockingQueue<>();
         consumer.setHook(notified::offer);

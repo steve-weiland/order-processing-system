@@ -26,7 +26,8 @@ public final class NotificationApp {
                 System.getenv().getOrDefault("JDBC_PASSWORD", "orders"));
 
         TopicAdmin.ensure(bootstrap, List.of(
-                new NewTopic("order-events", 3, (short) 1)));
+                new NewTopic("order-events", 3, (short) 1),
+                new NewTopic("order-events.dlq", 3, (short) 1)));
 
         HikariDataSource ds = Db.pool(jdbcUrl, jdbcUser, jdbcPassword, "notification-pool", 4);
         Migrations.migrate(ds);

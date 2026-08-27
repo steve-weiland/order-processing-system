@@ -1,6 +1,7 @@
 package com.steveweiland.orders.fulfillment;
 
 import com.steveweiland.orders.common.db.Db;
+import com.steveweiland.orders.common.dlq.DlqProducer;
 import com.steveweiland.orders.common.db.Migrations;
 import com.steveweiland.orders.common.topics.TopicAdmin;
 import com.steveweiland.orders.fulfillment.saga.InventoryStep;
@@ -57,7 +58,7 @@ public final class FulfillmentApp {
 
         ProcessedOrdersStore processedStore = new ProcessedOrdersStore();
         OutboxStore outboxStore = new OutboxStore(ds);
-        DlqProducer dlq = new DlqProducer(bootstrap);
+        DlqProducer dlq = new DlqProducer(bootstrap, "orders.dlq");
 
         SagaStore sagaStore = new SagaStore(ds);
         SagaOrchestrator orchestrator = new SagaOrchestrator(

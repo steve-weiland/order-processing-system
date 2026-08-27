@@ -2,6 +2,7 @@ package com.steveweiland.orders.fulfillment;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.steveweiland.orders.common.JsonMapper;
+import com.steveweiland.orders.common.dlq.DlqProducer;
 import com.steveweiland.orders.common.Order;
 import com.steveweiland.orders.common.OrderFulfilled;
 import com.steveweiland.orders.fulfillment.saga.SagaOrchestrator;

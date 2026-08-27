@@ -1,4 +1,4 @@
-package com.steveweiland.orders.fulfillment;
+package com.steveweiland.orders.common.dlq;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.KafkaProducer;
@@ -16,19 +16,14 @@ import java.util.concurrent.TimeUnit;
 
 public final class DlqProducer implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(DlqProducer.class);
-    public static final String DEFAULT_TOPIC = "orders.dlq";
 
     private final KafkaProducer<byte[], byte[]> producer;
     private final String topic;
 
-    public DlqProducer(String bootstrapServers) {
-        this(bootstrapServers, DEFAULT_TOPIC);
-    }
-
     public DlqProducer(String bootstrapServers, String topic) {
         Properties props = new Properties();
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
-        props.put(ProducerConfig.CLIENT_ID_CONFIG, "fulfillment-dlq");
+        props.put(ProducerConfig.CLIENT_ID_CONFIG, "dlq-" + topic);
         props.put(ProducerConfig.ACKS_CONFIG, "all");
         props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
         this.producer = new KafkaProducer<>(props, new ByteArraySerializer(), new ByteArraySerializer());
