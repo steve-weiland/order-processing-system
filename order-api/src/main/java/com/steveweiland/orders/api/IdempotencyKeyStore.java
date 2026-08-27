@@ -7,16 +7,23 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 
 /**
- * Postgres-backed store for the optional {@code Idempotency-Key} HTTP header.
- * <p>
- * On {@link #claim} the store atomically:
- * <ol>
- *   <li>Attempts to insert {@code (key, generatedOrderId)} via {@code ON CONFLICT DO NOTHING}.</li>
- *   <li>If the row is brand-new, returns {@link Decision#fresh}.</li>
- *   <li>If the row already existed (replay or race-loser), looks up the original
- *       {@code order_id} and returns {@link Decision#replay}.</li>
- * </ol>
- * Callers SHOULD NOT produce a Kafka record on a replay decision.
+ * Postgres-backed store for the optional {@code Idempotency-Key} HTTP header,
+ * with a two-phase (pending → confirmed) lifecycle.
+ *
+ * <p>{@link #claim} atomically inserts {@code (key, generatedOrderId)} with
+ * {@code confirmed_at} NULL; {@link #confirm} stamps it after the Kafka
+ * produce is acked. The three outcomes of a claim:
+ * <ul>
+ *   <li>{@code FRESH} — this caller owns the key; produce, then confirm.</li>
+ *   <li>{@code REPLAY_CONFIRMED} — a previous request produced successfully;
+ *       return the stored orderId, produce nothing.</li>
+ *   <li>{@code REPLAY_PENDING} — a previous attempt claimed the key but its
+ *       produce never succeeded. The caller MUST re-produce with the stored
+ *       orderId (duplicates on the topic are absorbed downstream by the
+ *       saga's terminal short-circuit + processed_orders) and then confirm.
+ *       Without this state, a produce failure poisoned the key forever: the
+ *       retry replayed an orderId that never reached Kafka.</li>
+ * </ul>
  */
 public final class IdempotencyKeyStore {
     private final DataSource ds;
@@ -34,15 +41,17 @@ public final class IdempotencyKeyStore {
                 ps.setString(2, generatedOrderId);
                 int rows = ps.executeUpdate();
                 if (rows == 1) {
-                    return Decision.fresh(generatedOrderId);
+                    return new Decision(generatedOrderId, State.FRESH);
                 }
             }
             try (PreparedStatement ps = c.prepareStatement(
-                    "SELECT order_id::text FROM idempotency_keys WHERE key = ?")) {
+                    "SELECT order_id::text, confirmed_at FROM idempotency_keys WHERE key = ?")) {
                 ps.setString(1, key);
                 try (ResultSet rs = ps.executeQuery()) {
                     if (rs.next()) {
-                        return Decision.replay(rs.getString(1));
+                        boolean confirmed = rs.getTimestamp(2) != null;
+                        return new Decision(rs.getString(1),
+                                confirmed ? State.REPLAY_CONFIRMED : State.REPLAY_PENDING);
                     }
                 }
             }
@@ -52,8 +61,25 @@ public final class IdempotencyKeyStore {
         }
     }
 
-    public record Decision(String orderId, boolean isReplay) {
-        public static Decision fresh(String id) { return new Decision(id, false); }
-        public static Decision replay(String id) { return new Decision(id, true); }
+    /** Mark the key's produce as acked. Idempotent; keeps the first stamp. */
+    public void confirm(String key) {
+        try (Connection c = ds.getConnection();
+             PreparedStatement ps = c.prepareStatement(
+                     "UPDATE idempotency_keys SET confirmed_at = now() " +
+                             "WHERE key = ? AND confirmed_at IS NULL")) {
+            ps.setString(1, key);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new RuntimeException("idempotency confirm failed for key=" + key, e);
+        }
+    }
+
+    public enum State { FRESH, REPLAY_CONFIRMED, REPLAY_PENDING }
+
+    public record Decision(String orderId, State state) {
+        /** True when the caller must produce (fresh claim or unconfirmed replay). */
+        public boolean mustProduce() {
+            return state != State.REPLAY_CONFIRMED;
+        }
     }
 }

@@ -2,7 +2,6 @@ package com.steveweiland.orders.api;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.steveweiland.orders.common.JsonMapper;
-import com.steveweiland.orders.common.Order;
 import com.steveweiland.orders.common.db.Db;
 import com.steveweiland.orders.common.db.Migrations;
 import com.steveweiland.orders.common.topics.TopicAdmin;
@@ -15,11 +14,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
-import java.math.BigDecimal;
-import java.time.Instant;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 public final class OrderApiApp {
     private static final Logger log = LoggerFactory.getLogger(OrderApiApp.class);
@@ -48,10 +44,11 @@ public final class OrderApiApp {
 
         IdempotencyKeyStore idempStore = new IdempotencyKeyStore(ds);
         OrderProducer producer = new OrderProducer(bootstrap);
+        OrderService service = new OrderService(producer::send, idempStore);
         Javalin app = Javalin.create(cfg -> cfg.showJavalinBanner = false);
 
         app.get("/health", ctx -> ctx.json(Map.of("status", "ok")));
-        app.post("/orders", ctx -> handleCreateOrder(ctx, producer, idempStore));
+        app.post("/orders", ctx -> handleCreateOrder(ctx, service));
 
         app.start(port);
         log.info("order-api listening on :{} bootstrap={} jdbc={}", port, bootstrap, jdbcUrl);
@@ -64,7 +61,7 @@ public final class OrderApiApp {
         }, "order-api-shutdown"));
     }
 
-    private static void handleCreateOrder(Context ctx, OrderProducer producer, IdempotencyKeyStore idempStore) {
+    private static void handleCreateOrder(Context ctx, OrderService service) {
         OrderRequest req;
         try {
             req = JSON.readValue(ctx.body(), OrderRequest.class);
@@ -79,40 +76,20 @@ public final class OrderApiApp {
             return;
         }
 
-        String idempotencyKey = ctx.header("Idempotency-Key");
-        String orderId;
-        boolean shouldProduce;
-        if (idempotencyKey != null && !idempotencyKey.isBlank()) {
-            IdempotencyKeyStore.Decision dec = idempStore.claim(idempotencyKey, UUID.randomUUID().toString());
-            orderId = dec.orderId();
-            shouldProduce = !dec.isReplay();
-            if (dec.isReplay()) {
-                MDC.put("orderId", orderId);
-                try {
-                    log.info("idempotent replay key={}", idempotencyKey);
-                } finally {
-                    MDC.remove("orderId");
-                }
-            }
-        } else {
-            orderId = UUID.randomUUID().toString();
-            shouldProduce = true;
-        }
-
-        MDC.put("orderId", orderId);
         try {
-            if (shouldProduce) {
-                BigDecimal total = OrderValidator.total(req);
-                Order order = new Order(orderId, req.customerId(), req.items(), total, Instant.now());
-                producer.send(order);
-                log.info("order accepted customerId={} total={}", req.customerId(), total);
+            OrderService.Result result = service.createOrder(req, ctx.header("Idempotency-Key"));
+            MDC.put("orderId", result.orderId());
+            try {
+                if (result.produced()) {
+                    log.info("order accepted customerId={}", req.customerId());
+                }
+                ctx.status(HttpStatus.ACCEPTED).json(Map.of("orderId", result.orderId()));
+            } finally {
+                MDC.remove("orderId");
             }
-            ctx.status(HttpStatus.ACCEPTED).json(Map.of("orderId", orderId));
         } catch (Exception e) {
             log.error("failed to publish order", e);
             ctx.status(HttpStatus.INTERNAL_SERVER_ERROR).json(Map.of("error", "failed to publish order"));
-        } finally {
-            MDC.remove("orderId");
         }
     }
 
