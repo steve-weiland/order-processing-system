@@ -12,6 +12,14 @@ import java.util.Optional;
 /**
  * Persists saga state. State transitions are compare-and-swap UPDATEs so two
  * orchestrator invocations cannot both advance from the same state.
+ *
+ * <p>Every method takes the caller's {@link Connection}: the orchestrator
+ * holds a per-order session advisory lock on one connection for the whole
+ * saga run, and all state reads/writes must ride that same session. A store
+ * method opening its own connection while the caller parks on the lock
+ * connection is how a 32-worker consumer exhausts a 16-connection pool.
+ * Connections arrive with autocommit on — each transition commits
+ * individually, which the crash-resume semantics (F11, F12) require.
  */
 public final class SagaStore {
     private final DataSource ds;
@@ -20,13 +28,17 @@ public final class SagaStore {
         this.ds = ds;
     }
 
+    public DataSource dataSource() {
+        return ds;
+    }
+
     /**
      * Atomically start a saga for the given orderId, or return the existing row
      * if one already exists. The atomic INSERT … ON CONFLICT DO NOTHING is the
      * gate against double-starting a saga under concurrent redelivery.
      */
-    public SagaRecord startOrResume(String orderId) {
-        try (Connection c = ds.getConnection()) {
+    public SagaRecord startOrResume(Connection c, String orderId) {
+        try {
             // Try to insert; on conflict, do nothing.
             try (PreparedStatement ps = c.prepareStatement(
                     "INSERT INTO sagas (saga_id, order_id, state) " +
@@ -69,12 +81,11 @@ public final class SagaStore {
      * updated (the caller still owns the saga); false if a concurrent attempt
      * had already advanced the state.
      */
-    public boolean transition(String sagaId, SagaState from, SagaState to, String stepDoneColumn) {
+    public boolean transition(Connection c, String sagaId, SagaState from, SagaState to, String stepDoneColumn) {
         String setColumn = stepDoneColumn == null ? "" : ", " + stepDoneColumn + " = now()";
-        try (Connection c = ds.getConnection();
-             PreparedStatement ps = c.prepareStatement(
-                     "UPDATE sagas SET state = ?, updated_at = now()" + setColumn +
-                             " WHERE saga_id = ?::uuid AND state = ?")) {
+        try (PreparedStatement ps = c.prepareStatement(
+                "UPDATE sagas SET state = ?, updated_at = now()" + setColumn +
+                        " WHERE saga_id = ?::uuid AND state = ?")) {
             ps.setString(1, to.name());
             ps.setString(2, sagaId);
             ps.setString(3, from.name());
@@ -92,12 +103,11 @@ public final class SagaStore {
      * final FAILED transition) is what makes compensation resumable: a crash
      * mid-compensation leaves a row that still knows what originally failed.
      */
-    public boolean beginCompensation(String sagaId, SagaState from, SagaState to,
+    public boolean beginCompensation(Connection c, String sagaId, SagaState from, SagaState to,
                                      String failureStep, String reason) {
-        try (Connection c = ds.getConnection();
-             PreparedStatement ps = c.prepareStatement(
-                     "UPDATE sagas SET state = ?, failure_step = ?, failure_reason = ?, " +
-                             "updated_at = now() WHERE saga_id = ?::uuid AND state = ?")) {
+        try (PreparedStatement ps = c.prepareStatement(
+                "UPDATE sagas SET state = ?, failure_step = ?, failure_reason = ?, " +
+                        "updated_at = now() WHERE saga_id = ?::uuid AND state = ?")) {
             ps.setString(1, to.name());
             ps.setString(2, failureStep);
             ps.setString(3, reason);
@@ -110,11 +120,10 @@ public final class SagaStore {
         }
     }
 
-    public boolean recordFailure(String sagaId, SagaState from, String failureStep, String reason) {
-        try (Connection c = ds.getConnection();
-             PreparedStatement ps = c.prepareStatement(
-                     "UPDATE sagas SET state = 'FAILED', failure_step = ?, failure_reason = ?, " +
-                             "updated_at = now() WHERE saga_id = ?::uuid AND state = ?")) {
+    public boolean recordFailure(Connection c, String sagaId, SagaState from, String failureStep, String reason) {
+        try (PreparedStatement ps = c.prepareStatement(
+                "UPDATE sagas SET state = 'FAILED', failure_step = ?, failure_reason = ?, " +
+                        "updated_at = now() WHERE saga_id = ?::uuid AND state = ?")) {
             ps.setString(1, failureStep);
             ps.setString(2, reason);
             ps.setString(3, sagaId);

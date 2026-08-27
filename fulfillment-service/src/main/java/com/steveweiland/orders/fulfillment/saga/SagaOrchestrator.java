@@ -4,6 +4,11 @@ import com.steveweiland.orders.common.Order;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+
 import static com.steveweiland.orders.fulfillment.saga.SagaState.COMPENSATING_INVENTORY;
 import static com.steveweiland.orders.fulfillment.saga.SagaState.COMPENSATING_PAYMENT;
 import static com.steveweiland.orders.fulfillment.saga.SagaState.COMPLETED;
@@ -21,6 +26,22 @@ import static com.steveweiland.orders.fulfillment.saga.SagaState.SHIPPING_PENDIN
  * off rather than re-executing completed work or, worse, falling through to
  * a bogus COMPLETED.
  *
+ * <p>Concurrent invocations for the same order (duplicate records in one
+ * poll batch, or two consumer instances during rebalance overlap) are
+ * serialized by a per-order Postgres <em>session</em> advisory lock (F13).
+ * The loser blocks until the winner finishes, then re-reads the saga row
+ * under the lock and short-circuits on the terminal state — each step
+ * executes exactly once per saga, never once per delivery. The entire run
+ * uses a single pooled connection: the lock and every state read/write ride
+ * the same session (a second connection per worker would exhaust the pool),
+ * and a session lock — unlike {@code pg_advisory_xact_lock} — survives the
+ * per-transition autocommits that crash-resume requires. If the JVM dies
+ * mid-saga, the session dies with it and Postgres releases the lock.
+ *
+ * <p>Under the lock a lost compare-and-swap is a logic bug, not a race — so
+ * every CAS result is enforced and a loss fails loudly rather than letting
+ * the invocation keep executing steps it no longer owns.
+ *
  * <p>The failure cause ({@code failure_step}/{@code failure_reason}) is
  * persisted by the transition that <em>enters</em> compensation, so a resumed
  * compensation can report the original failure without having seen the
@@ -34,19 +55,36 @@ public final class SagaOrchestrator {
     private static final Logger log = LoggerFactory.getLogger(SagaOrchestrator.class);
 
     private final SagaStore store;
+    private final DataSource ds;
     private final SagaStep payment;
     private final SagaStep inventory;
     private final SagaStep shipping;
 
     public SagaOrchestrator(SagaStore store, SagaStep payment, SagaStep inventory, SagaStep shipping) {
         this.store = store;
+        this.ds = store.dataSource();
         this.payment = payment;
         this.inventory = inventory;
         this.shipping = shipping;
     }
 
     public SagaResult run(Order order) {
-        SagaRecord saga = store.startOrResume(order.orderId());
+        try (Connection c = ds.getConnection()) {
+            advisoryLock(c, order.orderId(), true);
+            try {
+                return runLocked(c, order);
+            } finally {
+                advisoryLock(c, order.orderId(), false);
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("saga connection failed orderId=" + order.orderId(), e);
+        }
+    }
+
+    private SagaResult runLocked(Connection c, Order order) {
+        // Load AFTER acquiring the lock: a concurrent invocation may have
+        // driven the saga to terminal while we were blocked.
+        SagaRecord saga = store.startOrResume(c, order.orderId());
         if (saga.isTerminal()) {
             log.info("saga already terminal state={}", saga.state());
             return new SagaResult(saga.sagaId(), saga.state(), saga.failureStep(), saga.failureReason());
@@ -54,9 +92,9 @@ public final class SagaOrchestrator {
 
         return switch (saga.state()) {
             case PAYMENT_PENDING, INVENTORY_PENDING, SHIPPING_PENDING ->
-                    executeForward(order, saga);
+                    executeForward(c, order, saga);
             case COMPENSATING_INVENTORY, COMPENSATING_PAYMENT ->
-                    resumeCompensation(order, saga);
+                    resumeCompensation(c, order, saga);
             // isTerminal() short-circuited above; reaching here is a logic bug,
             // never a reason to report success.
             case COMPLETED, FAILED ->
@@ -64,28 +102,31 @@ public final class SagaOrchestrator {
         };
     }
 
-    private SagaResult executeForward(Order order, SagaRecord saga) {
+    private SagaResult executeForward(Connection c, Order order, SagaRecord saga) {
         SagaState state = saga.state();
         try {
             if (state == PAYMENT_PENDING) {
                 payment.execute(order);
-                store.transition(saga.sagaId(), PAYMENT_PENDING, INVENTORY_PENDING, "payment_done_at");
+                requireCas(store.transition(c, saga.sagaId(), PAYMENT_PENDING, INVENTORY_PENDING, "payment_done_at"),
+                        saga.sagaId(), PAYMENT_PENDING, INVENTORY_PENDING);
                 state = INVENTORY_PENDING;
             }
             if (state == INVENTORY_PENDING) {
                 inventory.execute(order);
-                store.transition(saga.sagaId(), INVENTORY_PENDING, SHIPPING_PENDING, "inventory_done_at");
+                requireCas(store.transition(c, saga.sagaId(), INVENTORY_PENDING, SHIPPING_PENDING, "inventory_done_at"),
+                        saga.sagaId(), INVENTORY_PENDING, SHIPPING_PENDING);
                 state = SHIPPING_PENDING;
             }
             if (state == SHIPPING_PENDING) {
                 shipping.execute(order);
-                store.transition(saga.sagaId(), SHIPPING_PENDING, COMPLETED, "shipping_done_at");
+                requireCas(store.transition(c, saga.sagaId(), SHIPPING_PENDING, COMPLETED, "shipping_done_at"),
+                        saga.sagaId(), SHIPPING_PENDING, COMPLETED);
             }
             log.info("saga completed");
             return new SagaResult(saga.sagaId(), COMPLETED, null, null);
         } catch (StepFailedException e) {
             log.warn("saga step failed step={} reason={}", e.stepName(), e.getMessage());
-            return failAndCompensate(order, saga.sagaId(), state, e);
+            return failAndCompensate(c, order, saga.sagaId(), state, e);
         }
     }
 
@@ -96,20 +137,24 @@ public final class SagaOrchestrator {
      * (see {@link SagaStore#beginCompensation}); from there the compensation
      * chain is shared with the resume path.
      */
-    private SagaResult failAndCompensate(Order order, String sagaId, SagaState atFailure, StepFailedException cause) {
+    private SagaResult failAndCompensate(Connection c, Order order, String sagaId,
+                                         SagaState atFailure, StepFailedException cause) {
         switch (atFailure) {
             case PAYMENT_PENDING ->
                     // No prior steps to compensate.
-                    store.recordFailure(sagaId, PAYMENT_PENDING, cause.stepName(), cause.getMessage());
+                    requireCas(store.recordFailure(c, sagaId, PAYMENT_PENDING, cause.stepName(), cause.getMessage()),
+                            sagaId, PAYMENT_PENDING, FAILED);
             case INVENTORY_PENDING -> {
-                store.beginCompensation(sagaId, INVENTORY_PENDING, COMPENSATING_PAYMENT,
-                        cause.stepName(), cause.getMessage());
-                compensateFrom(order, sagaId, COMPENSATING_PAYMENT);
+                requireCas(store.beginCompensation(c, sagaId, INVENTORY_PENDING, COMPENSATING_PAYMENT,
+                                cause.stepName(), cause.getMessage()),
+                        sagaId, INVENTORY_PENDING, COMPENSATING_PAYMENT);
+                compensateFrom(c, order, sagaId, COMPENSATING_PAYMENT);
             }
             case SHIPPING_PENDING -> {
-                store.beginCompensation(sagaId, SHIPPING_PENDING, COMPENSATING_INVENTORY,
-                        cause.stepName(), cause.getMessage());
-                compensateFrom(order, sagaId, COMPENSATING_INVENTORY);
+                requireCas(store.beginCompensation(c, sagaId, SHIPPING_PENDING, COMPENSATING_INVENTORY,
+                                cause.stepName(), cause.getMessage()),
+                        sagaId, SHIPPING_PENDING, COMPENSATING_INVENTORY);
+                compensateFrom(c, order, sagaId, COMPENSATING_INVENTORY);
             }
             default -> throw new IllegalStateException("unexpected compensation source state " + atFailure);
         }
@@ -117,9 +162,9 @@ public final class SagaOrchestrator {
     }
 
     /** Redelivery of a saga that crashed mid-compensation (F12). */
-    private SagaResult resumeCompensation(Order order, SagaRecord saga) {
+    private SagaResult resumeCompensation(Connection c, Order order, SagaRecord saga) {
         log.info("resuming compensation state={} failureStep={}", saga.state(), saga.failureStep());
-        compensateFrom(order, saga.sagaId(), saga.state());
+        compensateFrom(c, order, saga.sagaId(), saga.state());
         return new SagaResult(saga.sagaId(), FAILED, saga.failureStep(), saga.failureReason());
     }
 
@@ -128,15 +173,38 @@ public final class SagaOrchestrator {
      * transition before the next compensation so this chain is itself
      * resumable from any point.
      */
-    private void compensateFrom(Order order, String sagaId, SagaState state) {
+    private void compensateFrom(Connection c, Order order, String sagaId, SagaState state) {
         if (state == COMPENSATING_INVENTORY) {
             inventory.compensate(order);
-            store.transition(sagaId, COMPENSATING_INVENTORY, COMPENSATING_PAYMENT, null);
+            requireCas(store.transition(c, sagaId, COMPENSATING_INVENTORY, COMPENSATING_PAYMENT, null),
+                    sagaId, COMPENSATING_INVENTORY, COMPENSATING_PAYMENT);
             state = COMPENSATING_PAYMENT;
         }
         if (state == COMPENSATING_PAYMENT) {
             payment.compensate(order);
-            store.transition(sagaId, COMPENSATING_PAYMENT, FAILED, null);
+            requireCas(store.transition(c, sagaId, COMPENSATING_PAYMENT, FAILED, null),
+                    sagaId, COMPENSATING_PAYMENT, FAILED);
+        }
+    }
+
+    private static void requireCas(boolean won, String sagaId, SagaState from, SagaState to) {
+        if (!won) {
+            throw new IllegalStateException("lost saga CAS sagaId=" + sagaId + " " + from + "→" + to
+                    + " — concurrent transition under the per-order lock should be impossible");
+        }
+    }
+
+    private static void advisoryLock(Connection c, String orderId, boolean acquire) {
+        String fn = acquire ? "pg_advisory_lock" : "pg_advisory_unlock";
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT " + fn + "(hashtextextended(?, 0))")) {
+            ps.setString(1, orderId);
+            ps.execute();
+        } catch (SQLException e) {
+            // On acquire: fail the invocation (redelivery retries). On release:
+            // a broken connection's session is gone and Postgres drops its
+            // locks; Hikari evicts broken connections on close.
+            throw new RuntimeException("saga " + fn + " failed orderId=" + orderId, e);
         }
     }
 }

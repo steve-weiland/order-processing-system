@@ -24,7 +24,9 @@ import java.sql.Connection;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -126,7 +128,8 @@ public final class FulfillmentConsumer implements Runnable, AutoCloseable {
         Map<TopicPartition, Long> maxOffset = new ConcurrentHashMap<>();
         List<Future<?>> tasks = new ArrayList<>();
 
-        for (ConsumerRecord<String, byte[]> rec : batch) {
+        List<ConsumerRecord<String, byte[]>> records = dedupeByKey(batch);
+        for (ConsumerRecord<String, byte[]> rec : records) {
             tasks.add(workers.submit(() -> {
                 concurrency.acquireUninterruptibly();
                 try {
@@ -161,6 +164,56 @@ public final class FulfillmentConsumer implements Runnable, AutoCloseable {
         }
     }
 
+    /**
+     * Drop exact duplicates within a poll batch, keeping the LAST occurrence
+     * per (partition, key, value-bytes). True duplicates (producer retries,
+     * redelivery) are byte-identical; dispatching both onto the parallel
+     * executor would race two saga runs for the same order. Keeping the last
+     * occurrence means the committed offset (kept-offset + 1) also covers
+     * every dropped duplicate in that partition.
+     *
+     * <p>Value bytes are part of the identity on purpose: same-key records
+     * with DIFFERENT payloads are not duplicates (e.g. a poison record and a
+     * valid order sharing a partitioning key -- F4) and every one must be
+     * processed. Scoped per-partition because dropping a record from a
+     * partition where nothing else is processed would leave that partition's
+     * offset permanently uncommitted. Anything this filter can't prove
+     * identical -- cross-partition duplicates, differing bytes -- is
+     * serialized by the orchestrator's per-order advisory lock instead.
+     * Null-key records are never deduped.
+     */
+    static List<ConsumerRecord<String, byte[]>> dedupeByKey(ConsumerRecords<String, byte[]> batch) {
+        Map<String, List<ConsumerRecord<String, byte[]>>> perKey = new LinkedHashMap<>();
+        List<ConsumerRecord<String, byte[]>> nullKeyed = new ArrayList<>();
+        int total = 0;
+        for (ConsumerRecord<String, byte[]> rec : batch) {
+            total++;
+            if (rec.key() == null) {
+                nullKeyed.add(rec);
+                continue;
+            }
+            List<ConsumerRecord<String, byte[]>> variants =
+                    perKey.computeIfAbsent(rec.partition() + " " + rec.key(), k -> new ArrayList<>(1));
+            int i = 0;
+            for (; i < variants.size(); i++) {
+                if (Arrays.equals(variants.get(i).value(), rec.value())) {
+                    variants.set(i, rec);   // identical duplicate -- last one wins
+                    break;
+                }
+            }
+            if (i == variants.size()) {
+                variants.add(rec);          // same key, different payload -- keep both
+            }
+        }
+        List<ConsumerRecord<String, byte[]>> out = new ArrayList<>(total);
+        perKey.values().forEach(out::addAll);
+        out.addAll(nullKeyed);
+        if (out.size() < total) {
+            log.info("batch dedupe dropped {} duplicate record(s) of {}", total - out.size(), total);
+        }
+        return out;
+    }
+
     private void processOne(ConsumerRecord<String, byte[]> rec) {
         Order order;
         try {
@@ -177,6 +230,18 @@ public final class FulfillmentConsumer implements Runnable, AutoCloseable {
 
         MDC.put("orderId", order.orderId());
         try {
+            // OPS-101: idempotency gate BEFORE any fulfillment work. Redelivery
+            // of an already-processed order must not wake the saga (whose steps
+            // have side effects) — the terminal-state short-circuit inside the
+            // orchestrator remains as defense in depth. The atomic
+            // INSERT … ON CONFLICT below stays the authority for claiming.
+            try (Connection pre = ds.getConnection()) {
+                if (processedStore.exists(pre, order.orderId())) {
+                    log.info("idempotent skip (pre-saga) — already processed");
+                    return;
+                }
+            }
+
             log.info("starting saga customerId={} partition={} offset={}",
                     order.customerId(), rec.partition(), rec.offset());
 

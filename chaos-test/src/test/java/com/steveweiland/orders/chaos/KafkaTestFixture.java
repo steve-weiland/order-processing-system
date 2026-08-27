@@ -36,7 +36,9 @@ public abstract class KafkaTestFixture {
                 .withDatabaseName("orders").withUsername("orders").withPassword("orders");
         KAFKA.start();
         POSTGRES.start();
-        DS = Db.pool(POSTGRES.getJdbcUrl(), "orders", "orders", "chaos-pool", 8);
+        // Sized past the consumer's worker semaphore (32): each in-flight saga
+        // holds one connection for its whole run (per-order advisory lock).
+        DS = Db.pool(POSTGRES.getJdbcUrl(), "orders", "orders", "chaos-pool", 40);
         Migrations.migrate(DS);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try { DS.close(); } catch (Exception ignored) {}

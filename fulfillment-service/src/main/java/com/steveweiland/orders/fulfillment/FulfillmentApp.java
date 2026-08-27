@@ -47,7 +47,12 @@ public final class FulfillmentApp {
                 new NewTopic("order-events", 3, (short) 1),
                 new NewTopic("orders.dlq", 3, (short) 1)));
 
-        HikariDataSource ds = Db.pool(jdbcUrl, jdbcUser, jdbcPassword, "fulfillment-pool", 16);
+        // Pool must cover the worker semaphore: every in-flight saga holds one
+        // connection for its whole run (per-order advisory lock session), plus
+        // headroom for the outbox relay and the pre-saga idempotency checks. A
+        // pool smaller than the semaphore turns connection wait into the real
+        // concurrency bound (F5 lag regresses).
+        HikariDataSource ds = Db.pool(jdbcUrl, jdbcUser, jdbcPassword, "fulfillment-pool", workerPoolSize + 4);
         Migrations.migrate(ds);
 
         ProcessedOrdersStore processedStore = new ProcessedOrdersStore();
