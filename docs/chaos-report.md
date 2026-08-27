@@ -1,14 +1,17 @@
-# Chaos Report — V1 → V3
+# Chaos Report — V1 → v3.1.0
 
 > Companion to [README.md](../README.md) and [spec.md](../spec.md).
-> What follows is the V1 → V3 evolution recorded as eleven failure modes
-> (F1–F11). F1–F5 were V1 baselines; v2.0.0–v2.3.0 closed each one (F1–F4
-> via correctness mechanisms, F5 via parallel batch processing). F6 surfaced
-> at v2.2.0 (multi-instance) and was closed in the same release. F7 was a
-> v2.0.0–v2.2.0 known limitation closed at v2.3.0. F8–F11 are saga-specific
-> failure modes that V3.0.0 introduced and closed in the same release. Each
-> mode has a chaos test that locked in the broken behavior at the version
-> boundary and inverted to assert the fix.
+> What follows is the V1 → v3.1.0 evolution recorded as fifteen failure
+> modes (F1–F15). F1–F5 were V1 baselines; v2.0.0–v2.3.0 closed each one
+> (F1–F4 via correctness mechanisms, F5 via parallel batch processing). F6
+> surfaced at v2.2.0 (multi-instance) and was closed in the same release.
+> F7 was a v2.0.0–v2.2.0 known limitation closed at v2.3.0. F8–F11 are
+> saga-specific failure modes that V3.0.0 introduced and closed in the same
+> release. F12–F15 are latent defects found by a code review of v3.0.0 and
+> closed at v3.1.0 — three of them in blind spots of the existing suite,
+> which asserted event counts and single-threaded resume rather than
+> concurrent execution or mid-compensation crashes. Each mode has a chaos
+> test that locked in the broken behavior and asserts the fix.
 
 The premise of this build follows the [study plan](../../system-design-study-plan.md)
 philosophy: *you understand a system when you have operated a buggy version of
@@ -169,13 +172,12 @@ assertEquals(0, events.size());   // V1: PASSES
 `commitSync` runs only after the DB tx has committed:
 
 ```java
-// FulfillmentConsumer.run()
-for (rec : batch) {
-    processOne(rec);                        // includes DB tx commit
-    consumer.commitSync(Map.of(             // only reached on success
-        new TopicPartition(rec.topic(), rec.partition()),
-        new OffsetAndMetadata(rec.offset() + 1)));
-}
+// FulfillmentConsumer.processBatch() — per-batch since v2.1.0
+boolean allOk = /* every record in the poll batch succeeded */;
+if (allOk && !maxOffset.isEmpty()) {
+    consumer.commitSync(commits);           // only reached on success;
+}                                           // any failure → nothing commits,
+                                            // the batch replays at-least-once
 ```
 
 Durable state in Postgres is the gate; the offset cannot advance past it.
@@ -257,7 +259,7 @@ injected via `kafka-console-producer`:
 
 ```
 $ make consume-dlq
-x-dlq-reason:JsonParseException: Unrecognized token 'not': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')
+x-dlq-reason:com.fasterxml.jackson.core.JsonParseException: Unrecognized token 'not': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')
  at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); line: 1, column: 5],
 x-dlq-source-topic:orders,
 x-dlq-source-partition:2,
@@ -610,7 +612,10 @@ payment.compensationCount   = 1   ← refunded last
 
 The contract under test is **state-aware re-entry**: every state transition
 is persisted before the next step runs, so on redelivery the orchestrator
-resumes at the next pending step without re-executing completed work.
+resumes at the next pending step. Precisely: a step whose completion
+transition was *committed* is never re-executed. (A crash between a step's
+`execute()` returning and its transition committing re-runs that step —
+inherent at-least-once until per-step idempotency keys land in v3.2.0.)
 
 The test wraps `InventoryStep` with one that throws `RuntimeException` on
 first call (simulating a JVM crash). After the first run propagates the
@@ -657,6 +662,160 @@ $ docker exec ops-kafka /opt/kafka/bin/kafka-get-offsets.sh \
 
 ---
 
+# v3.1.0 — review hardening (F12–F15)
+
+v3.1.0's failure modes came from a code review of v3.0.0, not from a
+planned break-it exercise. Three of the four lived in blind spots of this
+very suite: F8–F11 asserted saga state and step counts in *single-threaded*
+runs and crash-resume only on the *forward* path, and F1 asserted the
+*event* count — which stays correct even when a step executes twice,
+because `processed_orders` dedupes the outbox row. The lesson recorded
+here: a chaos suite asserts exactly what it asserts, nothing more.
+
+## F12 — Crash mid-compensation resumed as COMPLETED
+
+### The v3.0.0 bug
+
+`SagaOrchestrator.run` handled only the three `*_PENDING` states.
+`COMPENSATING_INVENTORY` / `COMPENSATING_PAYMENT` are non-terminal, so a
+saga redelivered mid-compensation passed the `isTerminal()` gate, matched
+none of the forward blocks, and fell through to the method's tail — which
+logged "saga completed" and returned `COMPLETED`. The consumer then wrote
+an outbox row: a customer whose shipping failed and whose refund never
+finished got an `OrderFulfilled` notification, and the `sagas` row sat in
+`COMPENSATING_*` forever.
+
+### v3.1.0 fix
+
+Three pieces:
+
+1. **Exhaustive dispatch** — `run()` is a `switch` over every state; the
+   terminal arm throws (`IllegalStateException`) instead of any path
+   silently returning `COMPLETED`.
+2. **Resumable compensation chain** — `COMPENSATING_*` states resume the
+   remaining compensations and reach `FAILED`.
+3. **Failure cause persisted at compensation entry** (`beginCompensation`
+   CAS writes `failure_step`/`failure_reason` in the same UPDATE) — a
+   resumed run reports the original failure without the original
+   exception, which died with the crashed JVM.
+
+Compensations are consequently required to be idempotent (OPS-225): a
+crash after `compensate()` but before its transition commits re-runs that
+compensation on resume.
+
+### Evidence
+
+`F12_CompensationResumeAfterCrashTest`, three scenarios: crash during
+`inventory.compensate` (resume from `COMPENSATING_INVENTORY`), crash
+during `payment.compensate` (resume from `COMPENSATING_PAYMENT` — the
+already-done inventory release is *not* re-run), terminal-`FAILED`
+short-circuit on a third delivery. The regression guard is
+`assertFalse(result.isCompleted())` — pre-fix code returned `COMPLETED`
+exactly there.
+
+## F13 — Concurrent duplicate deliveries double-executed saga steps
+
+### The v3.0.0 bug
+
+Two deliveries of the same order — duplicate records in one poll batch
+dispatched onto the v2.1.0 parallel executor, or two instances during a
+rebalance overlap — both loaded the saga at `PAYMENT_PENDING` and both ran
+`payment.execute()`: a double charge. The OPS-213 CAS transitions existed,
+but the orchestrator discarded their results, so the loser kept executing
+inventory and shipping too. F1 stayed green throughout: it asserts one
+*event*, and the `processed_orders` claim dedupes the outbox row even when
+the steps ran twice.
+
+### v3.1.0 fix
+
+Three layers, cheapest first:
+
+1. **Batch dedupe** on (partition, key, value bytes), keeping the last
+   occurrence. Value bytes are part of the identity on purpose — the first
+   cut deduped on key alone and promptly broke F4, whose poison record
+   deliberately shares a key with a valid order. Different bytes are
+   different records.
+2. **Per-order session advisory lock**
+   (`pg_advisory_lock(hashtextextended(orderId, 0))`) held for the saga
+   run's full duration; the loser blocks, re-reads the saga row under the
+   lock, and short-circuits on the winner's terminal state. The lock rides
+   the same connection as every state transition — one connection per
+   in-flight saga. That surfaced a second regression during development:
+   holding a connection through the step sleeps made the pool the real
+   concurrency bound and F5's lag went 0 → 300 until the pool was sized
+   past the worker semaphore (`workerPoolSize + 4`). Both catches are
+   recorded here because the suite caught them — which is the point of
+   having it.
+3. **Enforced CAS** — under the lock a lost CAS is a logic bug;
+   `IllegalStateException` instead of silently continuing.
+
+### Evidence
+
+`F13_ConcurrentSagaDoubleExecutionTest`: two latched threads run the same
+order concurrently. Happy path: every step `executionCount == 1` (pre-fix:
+payment 2) and both invocations return `COMPLETED`. Compensation path
+(inventory always fails): charged once, refunded once — not once per
+delivery.
+
+## F14 — Produce failure poisoned an Idempotency-Key
+
+### The v2.0.0 bug
+
+OPS-103 as originally written: insert the key→orderId row, *then* produce.
+A produce failure returned 500 — but the key row was already committed, so
+the client's retry with the same key (the header's entire purpose) hit the
+replay path and got `202 {"orderId": …}` for an order that never reached
+Kafka and never would. A lost order reported as success, on the designed
+retry path, since v2.0.0.
+
+### v3.1.0 fix
+
+Two-phase lifecycle (migration V6, `confirmed_at`): a key is **pending**
+from claim until the broker ack, then **confirmed**. Confirmed replays
+return the stored orderId and produce nothing (unchanged HTTP behavior).
+Pending replays *re-produce with the stored orderId* and then confirm —
+safe, because the duplicate lands in exactly the machinery F13 built:
+batch dedupe, the per-order lock, `processed_orders`. The same
+at-least-once-plus-idempotency philosophy as the outbox (Q9), applied to
+the HTTP edge.
+
+### Evidence
+
+`F14_IdempotencyKeyProduceFailureTest`: first produce fails → key row
+exists with `confirmed_at` NULL and the topic is empty; the retry
+re-produces the same orderId exactly once and confirms; a third call is a
+confirmed replay and produces nothing.
+
+## F15 — Poison message on order-events stalled notification-service
+
+### The bug (latent since v2.3.0)
+
+The F4 lesson — never deserialize inside the Kafka deserializer — was
+applied only to fulfillment-service. notification-service kept a typed
+`JsonDeserializer` wired into its consumer: one malformed record on
+`order-events` threw out of `poll()`, killed the consumer thread, and
+stalled the partition on every restart, with no DLQ for that topic. The F7
+manual demo above pipes hand-typed JSON into `order-events` — one typo
+away from wedging the service.
+
+### v3.1.0 fix
+
+The F4 treatment, verbatim: deserialize as `byte[]`, parse in the loop,
+route parse failures to a new `order-events.dlq` with the standard
+`x-dlq-*` headers, commit the source offset, continue. `DlqProducer` moved
+to `common` so both consumers share it. `make consume-events-dlq` for
+triage.
+
+### Evidence
+
+`F15_NotificationPoisonMessageTest`: poison bytes, then a valid event on
+the *same key* (same partition, ordered behind the poison). The valid
+event still notifies — pre-fix the consumer died before reaching it — the
+consumer reports `crashed() == false`, and the poison sits on
+`order-events.dlq` with `x-dlq-source-topic=order-events`.
+
+---
+
 ## Summary table
 
 | # | Result | Mechanism | Test |
@@ -672,16 +831,29 @@ $ docker exec ops-kafka /opt/kafka/bin/kafka-get-offsets.sh \
 | F9 | inventory failure → payment refunded | reverse-order compensation (v3.0.0) | `F9_InventoryFailureCompensatesPaymentTest` |
 | F10 | shipping failure → both prior compensated | reverse-order compensation (v3.0.0) | `F10_ShippingFailureCompensatesAllTest` |
 | F11 | mid-saga crash → resume at next step | state-aware re-entry (v3.0.0) | `F11_SagaResumeAfterCrashTest` |
+| F12 | mid-compensation crash → resume, never a false COMPLETED | exhaustive dispatch + resumable compensation (v3.1.0) | `F12_CompensationResumeAfterCrashTest` |
+| F13 | concurrent duplicates → each step executes once | batch dedupe + per-order advisory lock + enforced CAS (v3.1.0) | `F13_ConcurrentSagaDoubleExecutionTest` |
+| F14 | produce failure never poisons an Idempotency-Key | two-phase claim, pending → confirmed (v3.1.0) | `F14_IdempotencyKeyProduceFailureTest` |
+| F15 | poison on order-events → DLQ, consumer survives | byte[] parse + order-events.dlq (v3.1.0) | `F15_NotificationPoisonMessageTest` |
 
-V3 chaos suite total runtime: **~30 s** (Testcontainers spin-up + 11 tests).
+v3.1.0 chaos suite total runtime: **~45 s** (Testcontainers spin-up + 15 failure modes / 19 tests).
 
 ---
 
-## Known v2.x limitations (deferred)
+## Known limitations (deferred, documented)
 
-- **No retry-before-DLQ** *(v2.4.0+ if needed)*. First parse failure
-  routes straight to DLQ. Fine for malformed JSON (deterministic — retries
-  won't help). Originally targeted for v2.3.0 but deferred: there's no
-  concrete transient-error path in the current pipeline that retry-topics
-  would mitigate. Will revisit when an external HTTP call or similar
-  flaky dependency lands.
+- **No retry-before-DLQ** *(revisit v3.2.0)*. First parse failure routes
+  straight to DLQ. Fine for malformed JSON (deterministic — retries won't
+  help). Revisit alongside per-step retries when a genuinely transient
+  error path (a real external call) lands.
+- **Step re-run window (OPS-224).** A crash between a step's `execute()`
+  returning and its transition committing re-runs that step on redelivery.
+  Inherent at-least-once; closed for real by per-step idempotency keys in
+  v3.2.0 when steps become external calls.
+- **Notification emit is at-most-once after the claim (OPS-134).** A crash
+  between the `processed_notifications` claim committing and the emit drops
+  that notification permanently. Invisible while the emit is a log line;
+  a real sender needs a notification-side outbox (spec OQ-1, v3.2.0).
+- **Compensation *failure* handling.** v3.1.0 made compensation resumable
+  and idempotent; a compensation that throws still just retries via
+  redelivery, forever. Budgets + alerting → v3.2.0.

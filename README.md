@@ -8,17 +8,20 @@ machine** (payment → inventory → ship) with compensating actions on failure.
 
 The V2.x correctness machinery — idempotency, transactional outbox, DLQ,
 multi-instance coordination via `SELECT FOR UPDATE SKIP LOCKED`, notification
-dedup — carries over unchanged in V3; the saga sits *above* it. Each
-mechanism was driven into the codebase by a deterministic chaos test that
-flipped its assertion at the version boundary; the diff on those tests is
-the portfolio artifact. 11 documented failure modes (F1–F11), 11 chaos
-tests, all green at HEAD.
+dedup — carries over into V3; the saga sits *above* it. v3.1.0 then
+hardened the saga against a code review of v3.0.0: four latent defects
+(F12–F15) that the original chaos tests were structurally blind to, each
+closed by a new test that failed against the old code. Each mechanism was
+driven into the codebase by a deterministic chaos test that flipped its
+assertion at the version boundary; the diff on those tests is the
+portfolio artifact. 15 documented failure modes (F1–F15), all green at
+HEAD.
 
 | | |
 |--|--|
-| **Spec** | [`spec.md`](./spec.md) — RFC-2119 requirements, V1 → V3 evolution |
+| **Spec** | [`spec.md`](./spec.md) — RFC-2119 requirements, V1 → v3.1.0 evolution |
 | **Chaos report** | [`docs/chaos-report.md`](./docs/chaos-report.md) — per-failure V1 baseline → fix history |
-| **Status** | `v3.0.0` released. All 11 documented failure modes (F1–F11) green in the chaos suite. |
+| **Status** | `v3.1.0` released. All 15 documented failure modes (F1–F15) green in the chaos suite. |
 
 ---
 
@@ -30,7 +33,7 @@ flowchart LR
     api -- producer --> orders[(orders<br/>Kafka topic)]
     orders -- consume --> ful["fulfillment-service<br/>byte[] deserialize"]
     ful -- parse FAIL --> dlq[(orders.dlq<br/>+ diagnostic headers)]
-    ful -- parse OK --> saga{{Saga orchestrator<br/>payment ▶ inventory ▶ ship<br/>compensations on failure<br/>state in sagas table}}
+    ful -- parse OK --> saga{{Saga orchestrator<br/>per-order advisory lock<br/>payment ▶ inventory ▶ ship<br/>compensations on failure<br/>state in sagas table}}
     saga -- COMPLETED --> txOk[[DB tx:<br/>processed_orders<br/>+ outbox row]]
     saga -- FAILED --> txFail[[DB tx:<br/>processed_orders<br/>only]]
     txOk --> commit[commitSync offset]
@@ -38,7 +41,8 @@ flowchart LR
     relay[outbox-relay thread<br/>FOR UPDATE SKIP LOCKED] -- poll --> outbox[(outbox table)]
     relay -- publish --> events[(order-events<br/>Kafka topic)]
     relay -- mark published --> outbox
-    events --> notif[notification-service<br/>processed_notifications dedup]
+    events --> notif["notification-service<br/>byte[] deserialize<br/>processed_notifications dedup"]
+    notif -- parse FAIL --> ndlq[(order-events.dlq<br/>+ diagnostic headers)]
     notif -- log --> stdout([stdout])
     pg[(Postgres)]
     api -.- pg
@@ -49,11 +53,11 @@ flowchart LR
 
 | Service | Stack | Role |
 |---------|-------|------|
-| `order-api` | Java 21, Javalin, kafka-clients, JDBC | HTTP producer on `:6080`; optional `Idempotency-Key` header for HTTP-layer dedup |
-| `fulfillment-service` | Java 21, kafka-clients, Postgres + saga orchestrator + outbox-relay thread | Saga drives payment → inventory → ship with compensations; per-batch `commitSync` after DB tx; parse failures → DLQ; outbox relay coordinates across instances via `SKIP LOCKED` |
-| `notification-service` | Java 21, kafka-clients, Postgres | Consumer with manual commit; idempotent log emit via `processed_notifications` |
-| `kafka` | `apache/kafka:3.8.1` KRaft | Single-node broker, 3 partitions per topic, `auto.create.topics.enable=false` |
-| `postgres` | `postgres:16-alpine` | Five Flyway-managed tables: `processed_orders`, `outbox`, `idempotency_keys`, `processed_notifications`, `sagas` |
+| `order-api` | Java 21, Javalin, kafka-clients, JDBC | HTTP producer on `:6080`; optional `Idempotency-Key` header with a two-phase (pending → confirmed) lifecycle — a produce failure never poisons a key |
+| `fulfillment-service` | Java 21, kafka-clients, Postgres + saga orchestrator + outbox-relay thread | Saga drives payment → inventory → ship with compensations, resumable from any state; per-order advisory lock serializes duplicate deliveries; per-batch `commitSync` after DB tx; parse failures → DLQ; outbox relay coordinates across instances via `SKIP LOCKED` |
+| `notification-service` | Java 21, kafka-clients, Postgres | Consumer with manual commit; idempotent log emit via `processed_notifications`; parse failures → `order-events.dlq` |
+| `kafka` | `apache/kafka:3.8.1` KRaft | Single-node broker, 4 topics, 3 partitions each, `auto.create.topics.enable=false` |
+| `postgres` | `postgres:16-alpine` | Five Flyway-managed tables (V1–V7 migrations): `processed_orders`, `outbox`, `idempotency_keys`, `processed_notifications`, `sagas` |
 
 ---
 
@@ -74,7 +78,11 @@ version that landed it.
 | F8 | (new in v3.0.0 — only exists once fulfillment is multi-step) Payment step fails — the first step of the saga. | **v3.0.0**: saga transitions directly to `FAILED` with `failure_step=payment`; nothing to compensate. `processed_orders` row inserted (idempotency); no outbox row, no notification. | `F8_PaymentFailureNoCompensationTest` |
 | F9 | Inventory fails after payment success. Without compensation, the customer would be charged but never receive their order. | **v3.0.0**: orchestrator walks completed steps in reverse — `payment.compensate()` refunds the charge before saga reaches `FAILED`. | `F9_InventoryFailureCompensatesPaymentTest` |
 | F10 | Shipping fails after payment + inventory success. | **v3.0.0**: compensations run in reverse order: `inventory.compensate()` releases reserved stock, then `payment.compensate()` refunds. | `F10_ShippingFailureCompensatesAllTest` |
-| F11 | Consumer crashes mid-saga (between two completed steps and the next one). | **v3.0.0**: state-aware re-entry — every transition is committed to Postgres before the next step runs, so on redelivery the orchestrator picks up at the next pending step without re-executing completed work. | `F11_SagaResumeAfterCrashTest` |
+| F11 | Consumer crashes mid-saga on the forward path. | **v3.0.0**: state-aware re-entry — every transition is committed to Postgres before the next step runs, so on redelivery the orchestrator picks up at the next pending step; a step whose completion was committed is never re-executed. | `F11_SagaResumeAfterCrashTest` |
+| F12 | (v3.0.0 bug, found in review) Consumer crashes mid-**compensation**. The dispatcher handled only `*_PENDING` states, so a saga redelivered in `COMPENSATING_*` fell through to a bogus `COMPLETED` — a false `OrderFulfilled` for a failed, still-charged order, refund never completed. | **v3.1.0**: exhaustive state dispatch; the compensation chain is resumable from any point; the failure cause is persisted by the transition that *enters* compensation, so the resumed run still knows what failed. | `F12_CompensationResumeAfterCrashTest` — regression guard asserts the resumed result is **not** `COMPLETED`. |
+| F13 | (v3.0.0 bug, found in review) Two concurrent deliveries of the same order both read `PAYMENT_PENDING` and both charged — the CAS transitions existed but their results were discarded. Invisible to F1, which counts *events*, not step *executions*. | **v3.1.0**: batch dedupe on (partition, key, value bytes) + a per-order Postgres session advisory lock around the whole saga run + enforced CAS results. Loser blocks, re-reads terminal state, short-circuits. | `F13_ConcurrentSagaDoubleExecutionTest` — two latched threads; `payment.executionCount() == 1` (pre-fix: 2). |
+| F14 | (v2.0.0 bug, found in review) `Idempotency-Key` was committed *before* the produce; a produce failure poisoned the key — the client's retry replayed an orderId that never reached Kafka. Lost order, reported as success. | **v3.1.0**: two-phase claim — pending on insert, confirmed on broker ack. A pending replay *re-produces* with the stored orderId; downstream dedup absorbs the duplicate. | `F14_IdempotencyKeyProduceFailureTest` |
+| F15 | (V1-class bug, found in review) `notification-service` still deserialized inside the Kafka deserializer — one malformed record on `order-events` killed the consumer and stalled the partition. The F4 lesson, unapplied one topic over. | **v3.1.0**: `byte[]` deserialize + in-loop parse; parse failures → `order-events.dlq` with the standard `x-dlq-*` headers; offset committed, partition keeps moving. | `F15_NotificationPoisonMessageTest` |
 
 Run the suite and watch the numbers come out:
 
@@ -91,6 +99,10 @@ $ make chaos
 [INFO] Tests run: 1, in F9_InventoryFailureCompensatesPay…    Time: 3.7s   PASS
 [INFO] Tests run: 1, in F10_ShippingFailureCompensatesAllT…   Time: 0.1s   PASS
 [INFO] Tests run: 1, in F11_SagaResumeAfterCrashTest          Time: 0.1s   PASS
+[INFO] Tests run: 3, in F12_CompensationResumeAfterCrashTest   Time: 0.4s   PASS
+[INFO] Tests run: 2, in F13_ConcurrentSagaDoubleExecutionTest  Time: 0.2s   PASS
+[INFO] Tests run: 1, in F14_IdempotencyKeyProduceFailureTest   Time: 5.3s   PASS
+[INFO] Tests run: 1, in F15_NotificationPoisonMessageTest      Time: 1.7s   PASS
 
 === chaos-test/target/lag-v2.1.txt ===
 burst=500 window=2s lag=0
@@ -123,7 +135,11 @@ on the outbox poll lets multiple in-process relays coordinate via the DB.
 `processed_orders` lookup (consumer layer) overlap. Both stay because they
 defend against different failure modes: HTTP retries that the broker never
 sees vs Kafka redelivery that the order-api never sees. Removing either
-opens a duplicate window.
+opens a duplicate window. v3.1.0 made the HTTP layer honest about produce
+failures: a key is *claimed* before the produce but *confirmed* only after
+the broker ack, so a 500'd request leaves the key pending and the retry
+re-produces with the same orderId instead of replaying an orderId that
+never reached Kafka (F14).
 
 **Straight-to-DLQ on first parse failure.** Production-grade systems retry N
 times before giving up. We don't — a JSON parse failure is structural, not
@@ -133,15 +149,23 @@ the pipeline yet); V3.0.0 sagas introduce real retryable calls, so v3.1.0
 will revisit retry topics layered on the saga steps where it actually buys
 something.
 
-**Fully-parallel batch processing, not per-key serial.** v2.1.0 dispatches
-every record in a `poll()` batch onto a virtual-thread executor with no
-ordering constraint. This works because of a **domain insight**: in this
-system, records with the same `orderId` are duplicates that the
-`processed_orders` idempotency check absorbs, and records with different
-`orderId` are independent. There is no per-key serialization requirement.
-If the domain ever grows one ("first cancel then place"), the right move
-is the [Confluent Parallel Consumer](https://github.com/confluentinc/parallel-consumer)
-with `KEY` ordering — not rolling our own per-key locks.
+**Parallel across keys, serialized within a key.** v2.1.0 dispatches every
+record in a `poll()` batch onto a virtual-thread executor, justified by a
+domain insight: same-`orderId` records are duplicates the idempotency check
+absorbs; different-`orderId` records are independent. The second half is
+still true. The first half quietly stopped being true at v3.0.0 — saga
+steps have side effects that run *before* the idempotency claim, so two
+concurrent duplicates could both charge the customer (F13). v3.1.0 keeps
+the cross-key parallelism (the part that fixes F5) and serializes within a
+key: exact duplicates are deduped inside the batch, and every saga run
+holds a per-order Postgres session advisory lock, so the second delivery
+blocks briefly and short-circuits on the winner's terminal state. The lock
+rides the same connection as the saga's state transitions — one connection
+per in-flight saga, which is why the pool is sized past the worker
+semaphore. If the domain ever grows a real ordering requirement ("first
+cancel then place"), the right move is still the
+[Confluent Parallel Consumer](https://github.com/confluentinc/parallel-consumer)
+with `KEY` ordering — not more homegrown locks.
 
 **Atomic claim, not check-then-insert.** With v2.0.0's serial loop, the
 fulfillment-service did `SELECT 1 FROM processed_orders` then `INSERT`.
@@ -182,14 +206,20 @@ each can fail; failures must compensate already-completed steps in
 reverse order. The orchestrator commits every state transition to
 Postgres *before* invoking the next step, which buys two important
 properties: (1) on JVM crash + redelivery, the orchestrator reads the
-saga's persisted state and picks up at the next pending step without
-re-executing completed ones (F11); (2) compensations are anchored in
-durable state, not in-memory bookkeeping. The trade-off is performance —
-each step adds a DB round-trip — and the assumption that compensations
-themselves succeed (compensation-failure handling is V3.1.0+ work).
-Real distributed sagas (separate services per step communicating over
-Kafka request/response) are a layer that fits cleanly on top of this
-state machine — V3.1.0+ when steps need to become real external calls.
+saga's persisted state and picks up where it left off — on the forward
+path (F11) *and*, since v3.1.0, mid-compensation (F12), with the failure
+cause persisted at compensation entry so the resumed run can still report
+it; (2) the *orchestration state* is durable. (The step *effects* are
+simulated in-memory per the spec — which is exactly why compensations are
+required to be idempotent (OPS-225) and why v3.2.0's real external calls
+need per-step idempotency keys.) The trade-offs: each step adds a DB
+round-trip; each in-flight saga holds a pooled connection for its run
+(the per-order lock); a step re-runs if the JVM dies between its
+`execute()` returning and the transition committing; and compensations
+that themselves *fail* still just retry via redelivery — budgets and
+alerting are v3.2.0 work. Real distributed sagas (separate services per
+step over Kafka request/response) fit cleanly on top of this state
+machine — v3.3.0.
 
 ---
 
@@ -275,14 +305,20 @@ make psql            # interactive Postgres
 Useful queries against the running Postgres:
 
 ```sql
--- fulfilled orders
-SELECT order_id, customer_id, fulfilled_at FROM processed_orders ORDER BY fulfilled_at;
+-- fulfilled orders (v3.1.0: failed sagas are also recorded here, as status='FAILED')
+SELECT order_id, customer_id, fulfilled_at FROM processed_orders
+WHERE status = 'FULFILLED' ORDER BY fulfilled_at;
+
+-- failed orders, joined to what step failed
+SELECT p.order_id, s.failure_step, s.failure_reason FROM processed_orders p
+JOIN sagas s USING (order_id) WHERE p.status = 'FAILED';
 
 -- outbox progress (published_at NULL means relay hasn't sent yet)
 SELECT id, topic, published_at IS NOT NULL AS published FROM outbox ORDER BY id;
 
 -- idempotency keys (24 h TTL by convention; not auto-reaped)
-SELECT key, order_id, created_at FROM idempotency_keys ORDER BY created_at DESC;
+-- confirmed_at NULL = claimed but produce never acked (retry will re-produce)
+SELECT key, order_id, created_at, confirmed_at FROM idempotency_keys ORDER BY created_at DESC;
 
 -- saga state (V3) — see what step each order reached and what failed
 SELECT order_id, state, failure_step, failure_reason FROM sagas ORDER BY updated_at DESC;
@@ -315,11 +351,11 @@ order-processing-system/
 ├── Makefile
 ├── pom.xml                         parent (Java 21, dep management)
 ├── common/                         shared DTOs, JSON serde, DB helpers, Flyway, TopicAdmin
-│   └── src/main/resources/db/migration/   V1..V5 SQL migrations
+│   └── src/main/resources/db/migration/   V1..V7 SQL migrations
 ├── order-api/                      HTTP → Kafka, Idempotency-Key store
 ├── fulfillment-service/            saga orchestrator + outbox relay + DLQ
 │   └── src/main/java/.../saga/    SagaState, SagaStep, *Step impls, SagaStore, SagaOrchestrator
-├── notification-service/           consumer + log + processed_notifications dedup
+├── notification-service/           consumer + log + processed_notifications dedup + order-events.dlq
 └── chaos-test/                     F1-F11 chaos tests (opt-in, profile=chaos)
 ```
 
@@ -337,14 +373,15 @@ Shipped:
 | `v2.2.0` ✅ | Multi-instance | F6 fixed — `SELECT FOR UPDATE SKIP LOCKED` lets multiple `fulfillment-service` JVMs share the same outbox without duplicate publishes |
 | `v2.3.0` ✅ | Hardening | F7 fixed — `processed_notifications` table closes the relay-crash duplicate-publish window |
 | `v3.0.0` ✅ | Architectural shift | Saga pattern (payment → inventory → ship) with compensating actions; F8–F11 chaos coverage |
+| `v3.1.0` ✅ | Review hardening | F12–F15 fixed: resumable compensation, per-order serialization (advisory lock + enforced CAS + batch dedupe), two-phase `Idempotency-Key`, `order-events.dlq`; failed-saga row shape (`processed_orders.status`); `make run-local` repaired; spec reconciled (Q32–Q35) |
 
 Open / future:
 
 | Version | Theme | Scope |
 |---------|-------|-------|
-| `v3.1.0` | Saga hardening | Per-step bounded retries with backoff (the v2.4.0-deferred work, now meaningful since saga steps are real retryable calls); compensation-failure handling with retry + alerting; `OrderFailed` event topic for customer-facing failure notifications |
-| `v3.2.0` | Real distributed sagas | Split payment / inventory / shipping into separate services; orchestrator drives them via Kafka request/response; per-step idempotency keys (`orderId + step.name`) |
-| `v3.3.0+` | Choose-your-own | Schema registry + Avro/Protobuf; OpenTelemetry tracing across the saga; Prometheus metrics; saga-state Grafana dashboard |
+| `v3.2.0` | Saga step reality | Per-step bounded retries with backoff; compensation-failure handling with retry + alerting; per-step idempotency keys (`orderId + step.name`) closing the execute-vs-commit re-run window (OPS-224); `OrderFailed` event topic; notification-side outbox (OQ-1) |
+| `v3.3.0` | Real distributed sagas | Split payment / inventory / shipping into separate services; orchestrator drives them via Kafka request/response |
+| `v3.4.0+` | Choose-your-own | Schema registry + Avro/Protobuf; OpenTelemetry tracing across the saga; Prometheus metrics; saga-state Grafana dashboard |
 
 ---
 

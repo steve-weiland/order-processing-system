@@ -34,7 +34,7 @@ public final class DlqProducer implements AutoCloseable {
         byte[] keyBytes = source.key() == null ? null : source.key().getBytes(StandardCharsets.UTF_8);
         ProducerRecord<byte[], byte[]> rec = new ProducerRecord<>(topic, keyBytes, source.value());
         Headers h = rec.headers();
-        h.add("x-dlq-reason", (cause.getClass().getSimpleName() + ": " + cause.getMessage()).getBytes(StandardCharsets.UTF_8));
+        h.add("x-dlq-reason", (cause.getClass().getName() + ": " + cause.getMessage()).getBytes(StandardCharsets.UTF_8));
         h.add("x-dlq-source-topic", source.topic().getBytes(StandardCharsets.UTF_8));
         h.add("x-dlq-source-partition", String.valueOf(source.partition()).getBytes(StandardCharsets.UTF_8));
         h.add("x-dlq-source-offset", String.valueOf(source.offset()).getBytes(StandardCharsets.UTF_8));

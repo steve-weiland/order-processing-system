@@ -35,9 +35,12 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  * Kafka redelivery after restart) reads the existing saga row, picks up at
  * the inventory step, and runs the saga to completion.
  *
- * The contract under test: each step's {@code execute} runs at most once
- * across the entire sequence — the resume-from-state machinery prevents
- * re-execution of already-completed steps.
+ * The contract under test: a step whose completion transition was COMMITTED
+ * is never re-executed — the resume-from-state machinery skips it. (A crash
+ * in the window between a step's execute() returning and its transition
+ * committing re-runs that step on redelivery — inherent at-least-once until
+ * per-step idempotency keys land in v3.2.0. This test crashes BEFORE the
+ * inventory step's effect, so every count here is exactly 1.)
  */
 @Tag("chaos")
 class F11_SagaResumeAfterCrashTest extends KafkaTestFixture {
