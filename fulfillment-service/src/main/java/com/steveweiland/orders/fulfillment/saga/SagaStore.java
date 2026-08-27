@@ -85,6 +85,31 @@ public final class SagaStore {
         }
     }
 
+    /**
+     * Compare-and-swap into a {@code COMPENSATING_*} state, persisting the
+     * failure cause in the same statement. Writing {@code failure_step} /
+     * {@code failure_reason} at compensation <em>start</em> (rather than at the
+     * final FAILED transition) is what makes compensation resumable: a crash
+     * mid-compensation leaves a row that still knows what originally failed.
+     */
+    public boolean beginCompensation(String sagaId, SagaState from, SagaState to,
+                                     String failureStep, String reason) {
+        try (Connection c = ds.getConnection();
+             PreparedStatement ps = c.prepareStatement(
+                     "UPDATE sagas SET state = ?, failure_step = ?, failure_reason = ?, " +
+                             "updated_at = now() WHERE saga_id = ?::uuid AND state = ?")) {
+            ps.setString(1, to.name());
+            ps.setString(2, failureStep);
+            ps.setString(3, reason);
+            ps.setString(4, sagaId);
+            ps.setString(5, from.name());
+            return ps.executeUpdate() == 1;
+        } catch (SQLException e) {
+            throw new RuntimeException("saga beginCompensation failed sagaId=" + sagaId
+                    + " from=" + from + " to=" + to, e);
+        }
+    }
+
     public boolean recordFailure(String sagaId, SagaState from, String failureStep, String reason) {
         try (Connection c = ds.getConnection();
              PreparedStatement ps = c.prepareStatement(
