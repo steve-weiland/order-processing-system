@@ -2,10 +2,10 @@
 
 | Field   | Value              |
 |---------|--------------------|
-| Version | 0.9 (draft)        |
+| Version | 0.9                |
 | Author  | Steve Weiland      |
-| Date    | 2026-08-26         |
-| Status  | Draft              |
+| Date    | 2026-09-04         |
+| Status  | Current            |
 
 ---
 

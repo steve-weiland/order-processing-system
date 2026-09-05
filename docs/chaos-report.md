@@ -1,4 +1,4 @@
-# Chaos Report — V1 → v3.1.0
+# Chaos Report — V1 → HEAD
 
 > Companion to [README.md](../README.md) and [spec.md](../spec.md).
 > What follows is the V1 → v3.1.0 evolution recorded as sixteen failure
