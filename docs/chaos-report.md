@@ -1,8 +1,8 @@
 # Chaos Report — V1 → v3.1.0
 
 > Companion to [README.md](../README.md) and [spec.md](../spec.md).
-> What follows is the V1 → v3.1.0 evolution recorded as fifteen failure
-> modes (F1–F15). F1–F5 were V1 baselines; v2.0.0–v2.3.0 closed each one
+> What follows is the V1 → v3.1.0 evolution recorded as sixteen failure
+> modes (F1–F16). F1–F5 were V1 baselines; v2.0.0–v2.3.0 closed each one
 > (F1–F4 via correctness mechanisms, F5 via parallel batch processing). F6
 > surfaced at v2.2.0 (multi-instance) and was closed in the same release.
 > F7 was a v2.0.0–v2.2.0 known limitation closed at v2.3.0. F8–F11 are
@@ -10,8 +10,10 @@
 > release. F12–F15 are latent defects found by a code review of v3.0.0 and
 > closed at v3.1.0 — three of them in blind spots of the existing suite,
 > which asserted event counts and single-threaded resume rather than
-> concurrent execution or mid-compensation crashes. Each mode has a chaos
-> test that locked in the broken behavior and asserts the fix.
+> concurrent execution or mid-compensation crashes. F16 came from a second
+> review pass after v3.1.0: the consumer could silently lose an order on a
+> transient failure. Each mode has a chaos test that locked in the broken
+> behavior and asserts the fix.
 
 The premise of this build follows the [study plan](../../system-design-study-plan.md)
 philosophy: *you understand a system when you have operated a buggy version of
@@ -828,6 +830,52 @@ consumer reports `crashed() == false`, and the poison sits on
 
 ---
 
+# Post-v3.1.0 — second review pass (F16)
+
+## F16 — Transient worker failure silently lost the order
+
+### The bug (latent since v2.1.0)
+
+When a worker failed (a DB blip during the fulfillment transaction, or a
+raw RuntimeException out of a saga step — anything that is not a handled
+`StepFailedException`), the batch skipped its commit and logged
+`worker failed; will redeliver after rebalance`. But the poll loop kept
+moving forward: the consumer's in-memory position had already advanced,
+so the next successful batch on that partition committed offsets **past**
+the failed record. The order was never processed and never redelivered —
+the log line's promise held only if no later commit ever touched the
+partition. OPS-37 required next-poll replay all along; the implementation
+didn't do it. Every crash-shaped test (F3, F11, F12) restarts the
+consumer, which rewinds to the committed offset and hides the hole;
+nothing exercised *survive a transient failure and keep consuming*.
+
+### The fix
+
+On a failed batch the consumer now seeks every partition of that batch
+back to the batch's first offset and pauses briefly before the re-poll
+(pacing, so a DB outage retries at a bounded rate instead of hot-spinning).
+The very next poll redelivers the whole batch in the same group
+generation. Records that had already succeeded are absorbed by the batch
+dedupe, the pre-saga idempotency gate, and the per-order advisory lock.
+
+### Evidence
+
+`F16_TransientFailureLosesOrderTest`: single-partition topic; a payment
+step that throws a raw RuntimeException on its first attempt for order A;
+order B sent after A's first attempt fails. Red at pre-fix HEAD —
+
+```
+org.awaitility.core.ConditionTimeoutException:
+  transiently-failed order recovered via seek-back redelivery, same group
+  generation ==> expected: <FULFILLED> but was: <null> within 30 seconds.
+```
+
+— order B fulfilled, order A gone. Green after the fix in 4.6 s: both
+orders `FULFILLED`, `crashed() == false`, and the flaky order's payment
+attempted twice (retry, not duplicate — the charge landed once).
+
+---
+
 ## Summary table
 
 | # | Result | Mechanism | Test |
@@ -847,8 +895,9 @@ consumer reports `crashed() == false`, and the poison sits on
 | F13 | concurrent duplicates → each step executes once | batch dedupe + per-order advisory lock + enforced CAS (v3.1.0) | `F13_ConcurrentSagaDoubleExecutionTest` |
 | F14 | produce failure never poisons an Idempotency-Key | two-phase claim, pending → confirmed (v3.1.0) | `F14_IdempotencyKeyProduceFailureTest` |
 | F15 | poison on order-events → DLQ, consumer survives | byte[] parse + order-events.dlq (v3.1.0) | `F15_NotificationPoisonMessageTest` |
+| F16 | transient failure → seek-back redelivery, order never lost | failed-batch seek to first offset + pace (post-v3.1.0) | `F16_TransientFailureLosesOrderTest` |
 
-v3.1.0 chaos suite total runtime: **~45 s** (Testcontainers spin-up + 15 failure modes / 19 tests).
+Chaos suite total runtime: **~60 s** (Testcontainers spin-up + 16 failure modes / 20 tests).
 
 ---
 

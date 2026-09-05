@@ -14,14 +14,14 @@ hardened the saga against a code review of v3.0.0: four latent defects
 closed by a new test that failed against the old code. Each mechanism was
 driven into the codebase by a deterministic chaos test that flipped its
 assertion at the version boundary; the diff on those tests is the
-portfolio artifact. 15 documented failure modes (F1–F15), all green at
+portfolio artifact. 16 documented failure modes (F1–F16), all green at
 HEAD.
 
 | | |
 |--|--|
 | **Spec** | [`spec.md`](./spec.md) — RFC-2119 requirements, V1 → v3.1.0 evolution |
 | **Chaos report** | [`docs/chaos-report.md`](./docs/chaos-report.md) — per-failure V1 baseline → fix history |
-| **Status** | `v3.1.0` released. All 15 documented failure modes (F1–F15) green in the chaos suite. |
+| **Status** | `v3.1.0` released; F16 (transient failure loses an order) found and closed since. All 16 documented failure modes (F1–F16) green in the chaos suite. |
 
 ---
 
@@ -83,6 +83,7 @@ version that landed it.
 | F13 | (v3.0.0 bug, found in review) Two concurrent deliveries of the same order both read `PAYMENT_PENDING` and both charged — the CAS transitions existed but their results were discarded. Invisible to F1, which counts *events*, not step *executions*. | **v3.1.0**: batch dedupe on (partition, key, value bytes) + a per-order Postgres session advisory lock around the whole saga run + enforced CAS results. Loser blocks, re-reads terminal state, short-circuits. | `F13_ConcurrentSagaDoubleExecutionTest` — two latched threads; `payment.executionCount() == 1` (pre-fix: 2). |
 | F14 | (v2.0.0 bug, found in review) `Idempotency-Key` was committed *before* the produce; a produce failure poisoned the key — the client's retry replayed an orderId that never reached Kafka. Lost order, reported as success. | **v3.1.0**: two-phase claim — pending on insert, confirmed on broker ack. A pending replay *re-produces* with the stored orderId; downstream dedup absorbs the duplicate. | `F14_IdempotencyKeyProduceFailureTest` |
 | F15 | (V1-class bug, found in review) `notification-service` still deserialized inside the Kafka deserializer — one malformed record on `order-events` killed the consumer and stalled the partition. The F4 lesson, unapplied one topic over. | **v3.1.0**: `byte[]` deserialize + in-loop parse; parse failures → `order-events.dlq` with the standard `x-dlq-*` headers; offset committed, partition keeps moving. | `F15_NotificationPoisonMessageTest` |
+| F16 | (v2.1.0 bug, found in a second review) A transient worker failure (DB blip, raw exception out of a step) skipped the batch commit — but the poll position kept advancing, so the next successful batch committed offsets **past** the failed record. Silently lost; "redeliver after rebalance" never came. F3 was blind (it kills the consumer before commit); nothing exercised *survive and keep consuming*. | Failed batch **seeks back** to its first offset per partition (paced) so the very next poll redelivers it — recovery in the same group generation, per OPS-37's replay requirement. Dedupe + idempotency gate + advisory lock absorb the survivors' reprocessing. | `F16_TransientFailureLosesOrderTest` — red at pre-fix HEAD: follower order fulfilled, victim never landed. |
 
 Run the suite and watch the numbers come out:
 
@@ -103,6 +104,7 @@ $ make chaos
 [INFO] Tests run: 2, in F13_ConcurrentSagaDoubleExecutionTest  Time: 0.2s   PASS
 [INFO] Tests run: 1, in F14_IdempotencyKeyProduceFailureTest   Time: 5.3s   PASS
 [INFO] Tests run: 1, in F15_NotificationPoisonMessageTest      Time: 1.7s   PASS
+[INFO] Tests run: 1, in F16_TransientFailureLosesOrderTest      Time: 4.6s   PASS
 
 === chaos-test/target/lag-v2.1.txt ===
 burst=500 window=2s lag=0
@@ -331,7 +333,7 @@ SELECT order_id, state, failure_step, failure_reason FROM sagas ORDER BY updated
 ```bash
 make build    # mvn compile
 make test     # unit tests only — no broker, ~1s
-make chaos    # Testcontainers + Kafka + Postgres, runs F1-F11, ~30s
+make chaos    # Testcontainers + Kafka + Postgres, runs F1-F16, ~60s
 make package  # shaded jars in each service's target/
 make clean    # mvn clean + docker compose down -v
 ```
@@ -356,7 +358,7 @@ order-processing-system/
 ├── fulfillment-service/            saga orchestrator + outbox relay + DLQ
 │   └── src/main/java/.../saga/    SagaState, SagaStep, *Step impls, SagaStore, SagaOrchestrator
 ├── notification-service/           consumer + log + processed_notifications dedup + order-events.dlq
-└── chaos-test/                     F1-F11 chaos tests (opt-in, profile=chaos)
+└── chaos-test/                     F1-F16 chaos tests (opt-in, profile=chaos)
 ```
 
 ---

@@ -44,6 +44,9 @@ public final class FulfillmentConsumer implements Runnable, AutoCloseable {
     public static final String DEFAULT_EVENTS_TOPIC = "order-events";
     public static final String DEFAULT_GROUP_ID = "fulfillment";
     public static final int DEFAULT_WORKER_POOL_SIZE = 32;
+    // Pace between a failed batch's seek-back and the re-poll: bounds retry
+    // pressure during an outage without meaningfully delaying recovery.
+    private static final long FAILED_BATCH_PAUSE_MS = 500;
 
     private final KafkaConsumer<String, byte[]> consumer;
     private final ObjectMapper mapper = JsonMapper.shared();
@@ -151,7 +154,7 @@ public final class FulfillmentConsumer implements Runnable, AutoCloseable {
                 f.get();
             } catch (ExecutionException e) {
                 allOk = false;
-                log.error("worker failed; will redeliver after rebalance", e.getCause());
+                log.error("worker failed; batch will be re-polled", e.getCause());
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
@@ -162,6 +165,38 @@ public final class FulfillmentConsumer implements Runnable, AutoCloseable {
             Map<TopicPartition, OffsetAndMetadata> commits = new HashMap<>();
             maxOffset.forEach((tp, off) -> commits.put(tp, new OffsetAndMetadata(off + 1)));
             consumer.commitSync(commits);
+        } else if (!allOk) {
+            seekBackToBatchStart(batch);
+        }
+    }
+
+    /**
+     * F16: a failed batch must be redelivered by THIS consumer, not by a
+     * hoped-for rebalance. Skipping the commit is not enough — the poll
+     * position keeps moving forward, so the next successful batch on the
+     * partition would commit offsets PAST the failed record, silently losing
+     * it. Seeking every partition of the batch back to its first offset makes
+     * the re-poll redeliver the whole batch; batch dedupe, the pre-saga
+     * idempotency gate, and the per-order advisory lock absorb the survivors'
+     * reprocessing. The pause paces retries so an outage (DB down) doesn't
+     * hot-spin the poll loop.
+     */
+    private void seekBackToBatchStart(ConsumerRecords<String, byte[]> batch) {
+        for (TopicPartition tp : batch.partitions()) {
+            long first = batch.records(tp).get(0).offset();
+            try {
+                consumer.seek(tp, first);
+                log.warn("seeking back for redelivery partition={} offset={}", tp.partition(), first);
+            } catch (IllegalStateException revoked) {
+                // Partition lost to a rebalance — the new owner resumes from
+                // the last committed offset, which is before this batch anyway.
+                log.warn("partition {} no longer assigned; rebalance will redeliver", tp);
+            }
+        }
+        try {
+            Thread.sleep(FAILED_BATCH_PAUSE_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
