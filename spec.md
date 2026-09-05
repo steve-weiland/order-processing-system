@@ -2,7 +2,7 @@
 
 | Field   | Value              |
 |---------|--------------------|
-| Version | 0.9                |
+| Version | 1.0                |
 | Author  | Steve Weiland      |
 | Date    | 2026-09-04         |
 | Status  | Current            |
@@ -215,6 +215,7 @@ client ──POST /orders──▶ order-api ──▶ [orders] ──▶ fulfil
 | OPS-74 | A root `Makefile` **MUST** expose targets: `build`, `test`, `chaos`, `run` (everything in docker), `run-local` (Kafka + Postgres in docker, services on host). |
 | OPS-76 | `docker-compose.yml` **MUST** run **two** `fulfillment-service` instances (`ops-fulfillment-1`, `ops-fulfillment-2`) sharing the broker and Postgres, demonstrating the multi-instance outbox coordination introduced in v2.2.0. |
 | OPS-77 | Postgres **MUST** persist its data in a named volume (`pgdata`): orders, sagas, and idempotency keys survive `make stop` / `make run` cycles; `make clean` (`down -v`) is the explicit wipe. The four app services carry `restart: unless-stopped` — they crash fast on terminal consumer errors, and the policy is what makes that design honest. |
+| OPS-78 | `docker-compose.yml` **MUST** pass `PAYMENT/INVENTORY/SHIPPING_FAILURE_RATE` through to both fulfillment instances (default `0.0`) so saga-failure demos are an env variable, not a compose edit. `make smoke` **MUST** gate the running stack end-to-end: order flow, `Idempotency-Key` replay, notification, DLQ diagnostic headers, and a failure-injection leg that proves the rate both applied and restored. |
 
 ### 3.9 Idempotency
 
@@ -604,6 +605,7 @@ Q20–Q23; v2.3.0 adds Q24–Q26; V3.0.0 adds Q27–Q31; v3.1.0 adds Q32–Q35.
 | 0.4 | 2026-04-29 | Steve Weiland | v2.2.0: multi-instance fulfillment via `SELECT FOR UPDATE SKIP LOCKED` on outbox poll, with the lock held across publish + mark-published in a single DB transaction. New F6 failure mode and chaos test; OPS-112 updated, OPS-115 relaxed to allow concurrent relays, OPS-119 added, OPS-76 added (two-instance docker-compose). Resolved Q20-Q23. |
 | 0.5 | 2026-04-29 | Steve Weiland | v2.3.0: notification-side idempotency closes the relay-crash duplicate-publish window. New `processed_notifications` table; OPS-52, OPS-53 flipped from "MUST NOT" to "MUST"; new §3.12 with OPS-130–OPS-133. F7 added to §6 / chaos suite. Retry-before-DLQ deferred to v2.4.0+ (Q26). Resolved Q24-Q26. |
 | 0.6 | 2026-04-29 | Steve Weiland | V3.0.0: saga pattern (orchestrated, in-process, synchronous) with payment → inventory → shipping. New §3.13 (orchestrator), §3.14 (state), §3.15 (steps); OPS-33 rewritten to delegate to the orchestrator; OPS-35 retired (replaced by per-step `Thread.sleep(10)` in OPS-221). F8–F11 added to §6 / chaos suite. Resolved Q27-Q31. |
+| 1.0 | 2026-09-04 | Steve Weiland | OPS-78: compose failure-rate passthrough (mirrors the Spring sibling repo) and the `make smoke` end-to-end gate (6 checks; the failure-injection leg is the passthrough's live proof). |
 | 0.9 | 2026-09-04 | Steve Weiland | Ops hardening: OPS-77 — pgdata named volume (state survives stop/run; clean wipes) and restart: unless-stopped on the app services (crash-fast needs a restarter). |
 | 0.8 | 2026-09-04 | Steve Weiland | F16 added to §6 / chaos suite (second review pass): a transient worker failure could silently lose an order — the failed batch skipped its commit but never sought back, so a later batch committed past the record. OPS-37 already required next-poll replay; the code now honors it (seek-back + pace). `F16_TransientFailureLosesOrderTest` red at pre-fix HEAD, green after. |
 | 0.7 | 2026-08-26 | Steve Weiland | v3.1.0 review hardening: F12–F15 added to §6 / chaos suite. Resumable compensation (OPS-203/214/225), per-order serialization (OPS-39/205, OPS-213 CAS enforcement), two-phase Idempotency-Key (OPS-17/102/103), notification DLQ (OPS-54/125/126, OPS-03 four topics), failed-saga row shape (OPS-100/33), at-most-once note (OPS-134), pool-sizing rule (OPS-38). Doc reconciliation: OPS-114 migration path, §4 schema/CLI drift, OPS-123↔Q26 contradiction, OPS-224 softened. Resolved Q32–Q35; opened OQ-1. Roadmap shifted (retries → v3.2.0, service split → v3.3.0). |

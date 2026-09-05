@@ -1,4 +1,4 @@
-.PHONY: build test chaos package run run-local run-kafka run-postgres logs stop clean order send-order topics psql consume-orders consume-events consume-dlq consume-events-dlq
+.PHONY: build test chaos smoke package run run-local run-kafka run-postgres logs stop clean order send-order topics psql consume-orders consume-events consume-dlq consume-events-dlq
 
 build:
 	mvn -ntp compile
@@ -11,6 +11,11 @@ chaos:
 	@echo
 	@echo '=== chaos-test/target/lag-v2.1.txt ==='
 	@cat chaos-test/target/lag-v2.1.txt 2>/dev/null || echo '(not produced — F5 may have failed)'
+
+# End-to-end gate over the running stack (make run first): order flow,
+# idempotency replay, notification, DLQ headers, saga failure injection.
+smoke:
+	@./scripts/smoke.sh
 
 package:
 	mvn -ntp -DskipTests package

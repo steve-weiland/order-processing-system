@@ -81,6 +81,9 @@ services:
       JDBC_USER: "orders"
       JDBC_PASSWORD: "orders"
       OUTBOX_POLL_MS: "100"
+      PAYMENT_FAILURE_RATE: "${PAYMENT_FAILURE_RATE:-0.0}"
+      INVENTORY_FAILURE_RATE: "${INVENTORY_FAILURE_RATE:-0.0}"
+      SHIPPING_FAILURE_RATE: "${SHIPPING_FAILURE_RATE:-0.0}"
 
   fulfillment-service-2:
     build:
@@ -99,6 +102,9 @@ services:
       JDBC_USER: "orders"
       JDBC_PASSWORD: "orders"
       OUTBOX_POLL_MS: "100"
+      PAYMENT_FAILURE_RATE: "${PAYMENT_FAILURE_RATE:-0.0}"
+      INVENTORY_FAILURE_RATE: "${INVENTORY_FAILURE_RATE:-0.0}"
+      SHIPPING_FAILURE_RATE: "${SHIPPING_FAILURE_RATE:-0.0}"
 
   notification-service:
     build:

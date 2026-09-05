@@ -334,6 +334,7 @@ SELECT order_id, state, failure_step, failure_reason FROM sagas ORDER BY updated
 make build    # mvn compile
 make test     # unit tests only — no broker, ~1s
 make chaos    # Testcontainers + Kafka + Postgres, runs F1-F16, ~60s
+make smoke    # end-to-end gate over the running compose stack (make run first)
 make package  # shaded jars in each service's target/
 make clean    # mvn clean + docker compose down -v
 ```
