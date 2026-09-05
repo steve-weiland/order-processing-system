@@ -45,6 +45,7 @@ services:
       context: .
       dockerfile: order-api/Dockerfile
     container_name: ops-order-api
+    restart: unless-stopped
     depends_on:
       kafka:
         condition: service_healthy
@@ -64,6 +65,7 @@ services:
       context: .
       dockerfile: fulfillment-service/Dockerfile
     container_name: ops-fulfillment-1
+    restart: unless-stopped
     depends_on:
       kafka:
         condition: service_healthy
@@ -81,6 +83,7 @@ services:
       context: .
       dockerfile: fulfillment-service/Dockerfile
     container_name: ops-fulfillment-2
+    restart: unless-stopped
     depends_on:
       kafka:
         condition: service_healthy
@@ -98,6 +101,7 @@ services:
       context: .
       dockerfile: notification-service/Dockerfile
     container_name: ops-notifications
+    restart: unless-stopped
     depends_on:
       kafka:
         condition: service_healthy
