@@ -36,9 +36,11 @@ run-local: run-kafka run-postgres
 logs:
 	docker compose logs -f order-api fulfillment-service-1 fulfillment-service-2 notification-service
 
+# Containers go, the pgdata volume stays — orders survive the next `make run`.
 stop:
 	docker compose down
 
+# Full wipe: build output AND volumes (pgdata included).
 clean:
 	mvn -ntp clean
 	docker compose down -v 2>/dev/null || true

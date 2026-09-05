@@ -34,6 +34,10 @@ services:
       POSTGRES_PASSWORD: orders
     ports:
       - "6432:5432"
+    volumes:
+      # Orders, sagas, and idempotency keys survive `make stop`;
+      # `make clean` (down -v) is the wipe.
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U orders -d orders"]
       interval: 5s
@@ -112,3 +116,6 @@ services:
       JDBC_URL: "jdbc:postgresql://postgres:5432/orders"
       JDBC_USER: "orders"
       JDBC_PASSWORD: "orders"
+
+volumes:
+  pgdata:
